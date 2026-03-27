@@ -33,6 +33,9 @@ Osstem-AI-3/
 │       ├── data_processor.py   데이터 정제 (pandas)
 │       ├── template_writer.py  양식 붙여넣기 (openpyxl)
 │       └── utils.py            로거, retry 데코레이터
+├── .claude/
+│   └── commands/
+│       └── sync.md       /sync 커스텀 슬래시 커맨드
 └── CLAUDE.md
 ```
 
