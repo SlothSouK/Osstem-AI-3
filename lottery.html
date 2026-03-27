@@ -1,0 +1,759 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>부서 이벤트 뽑기</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #0d0d1a;
+      color: #fff;
+      font-family: 'Segoe UI', 'Noto Sans KR', sans-serif;
+      height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+    }
+
+    .screen { display: none; width: 100%; height: 100vh; align-items: center; justify-content: center; }
+    .screen.active { display: flex; }
+
+    /* ── 이름 입력 화면 ── */
+    #screen-input {
+      flex-direction: column;
+      gap: 24px;
+      max-width: 480px;
+      width: 90%;
+    }
+
+    .title {
+      text-align: center;
+    }
+    .title h1 {
+      font-size: 2rem;
+      font-weight: 800;
+      background: linear-gradient(135deg, #a78bfa, #60a5fa, #34d399);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      margin-bottom: 6px;
+    }
+    .title p {
+      color: #6b7280;
+      font-size: 0.9rem;
+    }
+
+    .input-box {
+      background: #1a1a2e;
+      border: 1px solid #2d2d4e;
+      border-radius: 12px;
+      padding: 16px;
+    }
+    .input-box label {
+      display: block;
+      font-size: 0.8rem;
+      color: #9ca3af;
+      margin-bottom: 8px;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
+    textarea {
+      width: 100%;
+      height: 180px;
+      background: #0d0d1a;
+      border: 1px solid #374151;
+      border-radius: 8px;
+      color: #e5e7eb;
+      font-size: 1rem;
+      padding: 10px 12px;
+      resize: none;
+      font-family: inherit;
+      line-height: 1.8;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    textarea:focus { border-color: #7c3aed; }
+    textarea::placeholder { color: #4b5563; }
+
+    .count-badge {
+      margin-top: 8px;
+      font-size: 0.8rem;
+      color: #60a5fa;
+    }
+
+    .btn-start {
+      width: 100%;
+      padding: 14px;
+      background: linear-gradient(135deg, #7c3aed, #2563eb);
+      border: none;
+      border-radius: 10px;
+      color: #fff;
+      font-size: 1.1rem;
+      font-weight: 700;
+      cursor: pointer;
+      transition: opacity 0.2s, transform 0.1s;
+      letter-spacing: 0.05em;
+    }
+    .btn-start:hover { opacity: 0.9; transform: translateY(-1px); }
+    .btn-start:active { transform: translateY(0); }
+    .btn-start:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
+
+    .error-msg {
+      color: #f87171;
+      font-size: 0.85rem;
+      text-align: center;
+      min-height: 20px;
+    }
+
+    /* ── 게임 화면 ── */
+    #screen-game {
+      position: relative;
+      flex-direction: column;
+    }
+
+    #game-canvas {
+      display: block;
+    }
+
+    .game-controls {
+      position: absolute;
+      top: 16px;
+      right: 16px;
+      display: flex;
+      gap: 10px;
+    }
+
+    .btn-small {
+      padding: 8px 16px;
+      background: rgba(255,255,255,0.08);
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 8px;
+      color: #e5e7eb;
+      font-size: 0.85rem;
+      cursor: pointer;
+      transition: background 0.2s;
+      backdrop-filter: blur(4px);
+    }
+    .btn-small:hover { background: rgba(255,255,255,0.15); }
+
+    /* ── 당첨자 화면 ── */
+    #screen-winner {
+      position: relative;
+      flex-direction: column;
+      gap: 32px;
+      text-align: center;
+    }
+
+    #confetti-canvas {
+      position: absolute;
+      top: 0; left: 0;
+      width: 100%; height: 100%;
+      pointer-events: none;
+    }
+
+    .winner-box {
+      position: relative;
+      z-index: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 20px;
+    }
+
+    .winner-label {
+      font-size: 1.1rem;
+      color: #9ca3af;
+      letter-spacing: 0.15em;
+      text-transform: uppercase;
+    }
+
+    .winner-trophy {
+      font-size: 4rem;
+      animation: bounce 0.8s ease infinite alternate;
+    }
+
+    @keyframes bounce {
+      from { transform: translateY(0); }
+      to   { transform: translateY(-12px); }
+    }
+
+    .winner-name {
+      font-size: 3.5rem;
+      font-weight: 900;
+      background: linear-gradient(135deg, #fbbf24, #f59e0b, #fcd34d);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      text-shadow: none;
+      padding: 0 20px;
+    }
+
+    .winner-sub {
+      font-size: 1rem;
+      color: #6b7280;
+    }
+
+    .winner-actions {
+      position: relative;
+      z-index: 1;
+      display: flex;
+      gap: 12px;
+    }
+
+    .btn-winner {
+      padding: 12px 28px;
+      border-radius: 10px;
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity 0.2s, transform 0.1s;
+      border: none;
+    }
+    .btn-winner:hover { opacity: 0.85; transform: translateY(-1px); }
+    .btn-winner.primary {
+      background: linear-gradient(135deg, #7c3aed, #2563eb);
+      color: #fff;
+    }
+    .btn-winner.secondary {
+      background: rgba(255,255,255,0.08);
+      border: 1px solid rgba(255,255,255,0.2);
+      color: #e5e7eb;
+    }
+  </style>
+</head>
+<body>
+
+<!-- ① 이름 입력 화면 -->
+<div id="screen-input" class="screen active">
+  <div class="title">
+    <h1>부서 이벤트 뽑기</h1>
+    <p>탈출 서바이벌 — 가장 먼저 원을 빠져나가는 사람이 당첨!</p>
+  </div>
+  <div class="input-box">
+    <label>참가자 이름 (한 줄에 한 명)</label>
+    <textarea id="names-input" placeholder="홍길동&#10;김철수&#10;이영희&#10;박지민&#10;..."></textarea>
+    <div class="count-badge" id="count-badge">참가자 0명</div>
+  </div>
+  <div class="error-msg" id="error-msg"></div>
+  <button class="btn-start" id="btn-start" disabled>게임 시작</button>
+</div>
+
+<!-- ② 게임 화면 -->
+<div id="screen-game" class="screen">
+  <canvas id="game-canvas"></canvas>
+  <div class="game-controls">
+    <button class="btn-small" id="btn-stop">중지 / 새 게임</button>
+  </div>
+</div>
+
+<!-- ③ 당첨자 화면 -->
+<div id="screen-winner" class="screen">
+  <canvas id="confetti-canvas"></canvas>
+  <div class="winner-box">
+    <div class="winner-label">당첨자</div>
+    <div class="winner-trophy">🏆</div>
+    <div class="winner-name" id="winner-name">-</div>
+    <div class="winner-sub">축하합니다!</div>
+  </div>
+  <div class="winner-actions">
+    <button class="btn-winner primary" id="btn-replay">다시 하기</button>
+    <button class="btn-winner secondary" id="btn-new-game">새 게임</button>
+  </div>
+</div>
+
+<script>
+'use strict';
+
+// ─────────────────────────────────────────────
+//  CONFIG
+// ─────────────────────────────────────────────
+const NUM_RINGS = 10;
+const GAPS_PER_RING = 4;  // 동서남북 4군데
+const BALL_RADIUS = 8;
+const TRAIL_LENGTH = 8;
+const GRAVITY = 0.07;
+const DAMPING = 0.975;
+const MIN_SPEED = 1.6;
+// 10겹, 간격 10% 추가 — makeRings()에서 동적 계산
+const GAP_SIZES        = [0.48, 0.44, 0.40, 0.37, 0.34, 0.31, 0.28, 0.26, 0.24, 0.22];
+const ROTATION_SPEEDS  = [0.040, -0.026, 0.020, -0.016, 0.012, -0.010, 0.008, -0.007, 0.006, -0.005];
+const RING_COLORS      = ['#818cf8','#60a5fa','#34d399','#fbbf24','#f87171','#a78bfa','#38bdf8','#4ade80','#fb923c','#f472b6'];
+
+const PALETTE = [
+  '#FF6B6B','#4ECDC4','#45B7D1','#96CEB4','#FFEAA7',
+  '#DDA0DD','#98D8C8','#F7DC6F','#BB8FCE','#85C1E9',
+  '#F0B27A','#82E0AA','#F1948A','#AED6F1','#A9DFBF',
+  '#FAD7A0','#D2B4DE','#A3E4D7','#FFB347','#B0E0E6',
+];
+
+const CONFETTI_COLORS = [
+  '#ff0000','#ff7700','#ffff00','#00ff00','#0077ff',
+  '#8800ff','#ff00ff','#00ffff','#ffffff','#ffd700',
+];
+
+// ─────────────────────────────────────────────
+//  STATE
+// ─────────────────────────────────────────────
+let state = {
+  phase: 'input',     // 'input' | 'running' | 'winner'
+  balls: [],
+  rings: [],
+  winner: null,
+  animId: null,
+  cx: 0,
+  cy: 0,
+  canvasSize: 0,
+  lastNames: [],
+};
+
+let canvas, ctx, confCanvas, confCtx;
+let lastTs = 0;
+let confParticles = [];
+let confAnimId = null;
+
+// ─────────────────────────────────────────────
+//  FACTORIES
+// ─────────────────────────────────────────────
+function makeBall(name, color, cx, cy, idx, total) {
+  const angle = (2 * Math.PI / total) * idx;
+  const r = 25;
+  return {
+    name,
+    color,
+    x: cx + Math.cos(angle) * r,
+    y: cy + Math.sin(angle) * r,
+    vx: (Math.random() - 0.5) * 10,
+    vy: (Math.random() - 0.5) * 10,
+    ring: 0,
+    escaped: false,
+    trail: [],
+    trailIdx: 0,
+  };
+}
+
+function makeRings(canvasSize) {
+  const usable = (canvasSize / 2) - 24;
+  const N = NUM_RINGS;
+  const minInner = 44;                    // 가장 안쪽 원 최소 반지름
+  const outerRadius = usable * 0.96;
+  // innermost >= minInner 보장하면서 outermost까지 균등 배치 (10겹 자체가 원래 5겹보다 조밀해서 간격 자체는 충분히 확보됨)
+  const step = (outerRadius - minInner) / (N - 1);
+  const innerRadius = minInner;
+  const rings = [];
+  for (let i = 0; i < N; i++) {
+    rings.push({
+      radius: innerRadius + i * step,
+      gapAngle: (Math.random() * Math.PI / 2),
+      gapSize: GAP_SIZES[i],
+      rotSpeed: ROTATION_SPEEDS[i],
+      color: RING_COLORS[i],
+    });
+  }
+  return rings;
+}
+
+// ─────────────────────────────────────────────
+//  PHYSICS
+// ─────────────────────────────────────────────
+function canPassThrough(ring, exitAngle) {
+  const ballAng = Math.asin(Math.min(BALL_RADIUS / ring.radius, 1));
+  const halfGap = ring.gapSize / 2 - ballAng;
+  if (halfGap <= 0) return false;
+  // 동서남북 4군데: gapAngle + k * π/2 (k = 0,1,2,3)
+  for (let k = 0; k < GAPS_PER_RING; k++) {
+    const center = ring.gapAngle + k * (Math.PI / 2);
+    let diff = exitAngle - center;
+    diff = ((diff + Math.PI) % (2 * Math.PI)) - Math.PI;
+    if (Math.abs(diff) < halfGap) return true;
+  }
+  return false;
+}
+
+function reflectOff(ball, nx, ny) {
+  const dot = ball.vx * nx + ball.vy * ny;
+  ball.vx = (ball.vx - 2 * dot * nx) * DAMPING;
+  ball.vy = (ball.vy - 2 * dot * ny) * DAMPING;
+}
+
+function enforceMinSpeed(ball) {
+  const spd = Math.hypot(ball.vx, ball.vy);
+  if (spd < MIN_SPEED && spd > 0) {
+    const scale = MIN_SPEED / spd;
+    ball.vx *= scale;
+    ball.vy *= scale;
+  } else if (spd === 0) {
+    ball.vx = (Math.random() - 0.5) * MIN_SPEED * 2;
+    ball.vy = (Math.random() - 0.5) * MIN_SPEED * 2;
+  }
+}
+
+function updateBall(ball, cx, cy, rings, dt) {
+  const scale = dt / 16.667;
+
+  // gravity
+  ball.vy += GRAVITY * scale;
+  ball.x  += ball.vx * scale;
+  ball.y  += ball.vy * scale;
+
+  const dx   = ball.x - cx;
+  const dy   = ball.y - cy;
+  const dist = Math.hypot(dx, dy);
+
+  if (dist === 0) return;
+
+  const nx = dx / dist;
+  const ny = dy / dist;
+
+  // ── inner boundary (ring > 0 has an inner ring) ──
+  if (ball.ring > 0) {
+    const innerR = rings[ball.ring - 1].radius;
+    if (dist - BALL_RADIUS < innerR) {
+      // bounce off the inner ring's outer surface (outward normal)
+      reflectOff(ball, nx, ny);
+      const push = innerR - (dist - BALL_RADIUS) + 0.5;
+      ball.x += nx * push;
+      ball.y += ny * push;
+    }
+  }
+
+  // ── outer boundary ──
+  const outerR = rings[ball.ring].radius;
+  if (dist + BALL_RADIUS >= outerR) {
+    const exitAngle = Math.atan2(dy, dx);
+    if (canPassThrough(rings[ball.ring], exitAngle)) {
+      ball.ring += 1;
+      if (ball.ring >= NUM_RINGS) {
+        ball.escaped = true;
+        return;
+      }
+      // carry on — no velocity change needed
+    } else {
+      // bounce off inner surface of this ring (inward normal)
+      reflectOff(ball, -nx, -ny);
+      const push = (dist + BALL_RADIUS) - outerR + 0.5;
+      ball.x -= nx * push;
+      ball.y -= ny * push;
+    }
+  }
+
+  enforceMinSpeed(ball);
+
+  // update trail
+  ball.trail[ball.trailIdx % TRAIL_LENGTH] = { x: ball.x, y: ball.y };
+  ball.trailIdx++;
+}
+
+// ─────────────────────────────────────────────
+//  RENDERER
+// ─────────────────────────────────────────────
+function drawRings(rings, cx, cy) {
+  rings.forEach((ring) => {
+    const half = ring.gapSize / 2;
+
+    // 동서남북 4개 틈 — 틈과 틈 사이의 호(arc) 4개를 그림
+    ctx.strokeStyle = ring.color;
+    ctx.lineWidth = 3;
+    ctx.shadowBlur = 8;
+    ctx.shadowColor = ring.color;
+    for (let k = 0; k < GAPS_PER_RING; k++) {
+      const thisGapEnd  = ring.gapAngle + k * (Math.PI / 2) + half;
+      const nextGapStart = ring.gapAngle + (k + 1) * (Math.PI / 2) - half;
+      ctx.beginPath();
+      ctx.arc(cx, cy, ring.radius, thisGapEnd, nextGapStart);
+      ctx.stroke();
+    }
+    ctx.shadowBlur = 0;
+
+    // 틈 위치 금색 표시 (4군데)
+    ctx.strokeStyle = '#FFD700';
+    ctx.lineWidth = 5;
+    ctx.shadowBlur = 12;
+    ctx.shadowColor = '#FFD700';
+    for (let k = 0; k < GAPS_PER_RING; k++) {
+      const center = ring.gapAngle + k * (Math.PI / 2);
+      ctx.beginPath();
+      ctx.arc(cx, cy, ring.radius, center - 0.06, center + 0.06);
+      ctx.stroke();
+    }
+    ctx.shadowBlur = 0;
+  });
+}
+
+function drawBall(ball) {
+  if (ball.escaped) return;
+
+  // trail
+  const trailLen = Math.min(ball.trailIdx, TRAIL_LENGTH);
+  for (let i = 0; i < trailLen; i++) {
+    const idx = (ball.trailIdx - trailLen + i) % TRAIL_LENGTH;
+    const pt = ball.trail[idx];
+    if (!pt) continue;
+    const alpha = (i / trailLen) * 0.28;
+    ctx.globalAlpha = alpha;
+    ctx.beginPath();
+    ctx.arc(pt.x, pt.y, BALL_RADIUS * 0.65, 0, 2 * Math.PI);
+    ctx.fillStyle = ball.color;
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  // ball body (radial gradient)
+  const grad = ctx.createRadialGradient(
+    ball.x - BALL_RADIUS * 0.3, ball.y - BALL_RADIUS * 0.3, BALL_RADIUS * 0.1,
+    ball.x, ball.y, BALL_RADIUS
+  );
+  grad.addColorStop(0, lighten(ball.color, 60));
+  grad.addColorStop(1, ball.color);
+
+  ctx.beginPath();
+  ctx.arc(ball.x, ball.y, BALL_RADIUS, 0, 2 * Math.PI);
+  ctx.fillStyle = grad;
+  ctx.shadowBlur = 10;
+  ctx.shadowColor = ball.color;
+  ctx.fill();
+  ctx.shadowBlur = 0;
+
+  // name label
+  const fontSize = Math.max(9, Math.min(13, Math.floor(26 / Math.max(1, ball.name.length / 2))));
+  ctx.font = `bold ${fontSize}px 'Segoe UI', 'Noto Sans KR', sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+
+  // shadow/outline for readability
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = 'rgba(0,0,0,0.85)';
+  ctx.strokeText(ball.name, ball.x, ball.y + BALL_RADIUS + 3);
+  ctx.fillStyle = '#ffffff';
+  ctx.fillText(ball.name, ball.x, ball.y + BALL_RADIUS + 3);
+
+  ctx.textBaseline = 'alphabetic';
+}
+
+function lighten(hex, amt) {
+  const n = parseInt(hex.slice(1), 16);
+  const r = Math.min(255, (n >> 16) + amt);
+  const g = Math.min(255, ((n >> 8) & 0xff) + amt);
+  const b = Math.min(255, (n & 0xff) + amt);
+  return `rgb(${r},${g},${b})`;
+}
+
+function render(rings, balls, cx, cy) {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  // background glow at center
+  const bg = ctx.createRadialGradient(cx, cy, 0, cx, cy, rings[NUM_RINGS - 1].radius);
+  bg.addColorStop(0, 'rgba(124,58,237,0.07)');
+  bg.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  drawRings(rings, cx, cy);
+  balls.forEach(drawBall);
+}
+
+// ─────────────────────────────────────────────
+//  CONFETTI
+// ─────────────────────────────────────────────
+function makeConfParticle(w) {
+  return {
+    x: Math.random() * w,
+    y: -12,
+    vx: (Math.random() - 0.5) * 3.5,
+    vy: Math.random() * 3 + 1.5,
+    color: CONFETTI_COLORS[Math.floor(Math.random() * CONFETTI_COLORS.length)],
+    w: Math.random() * 10 + 5,
+    h: Math.random() * 6 + 3,
+    rot: Math.random() * 360,
+    rotSpd: (Math.random() - 0.5) * 9,
+    alpha: 1,
+  };
+}
+
+function runConfetti() {
+  const cw = confCanvas.width;
+  const ch = confCanvas.height;
+  confCtx.clearRect(0, 0, cw, ch);
+
+  // spawn
+  for (let i = 0; i < 6; i++) confParticles.push(makeConfParticle(cw));
+  if (confParticles.length > 300) confParticles.splice(0, confParticles.length - 300);
+
+  confParticles.forEach(p => {
+    p.x   += p.vx;
+    p.y   += p.vy;
+    p.vy  += 0.06;
+    p.rot += p.rotSpd;
+    if (p.y > ch * 0.8) p.alpha -= 0.02;
+  });
+  confParticles = confParticles.filter(p => p.alpha > 0 && p.y < ch + 20);
+
+  confParticles.forEach(p => {
+    confCtx.save();
+    confCtx.globalAlpha = p.alpha;
+    confCtx.translate(p.x, p.y);
+    confCtx.rotate(p.rot * Math.PI / 180);
+    confCtx.fillStyle = p.color;
+    confCtx.fillRect(-p.w / 2, -p.h / 2, p.w, p.h);
+    confCtx.restore();
+  });
+
+  confAnimId = requestAnimationFrame(runConfetti);
+}
+
+// ─────────────────────────────────────────────
+//  GAME LOOP
+// ─────────────────────────────────────────────
+function gameLoop(ts) {
+  state.animId = requestAnimationFrame(gameLoop);
+
+  const dt = Math.min(ts - lastTs, 32);
+  lastTs = ts;
+
+  // update ring rotations
+  const scale = dt / 16.667;
+  state.rings.forEach(r => {
+    r.gapAngle = (r.gapAngle + r.rotSpeed * scale) % (2 * Math.PI);
+  });
+
+  // update balls
+  let escaped = null;
+  state.balls.forEach(ball => {
+    if (!ball.escaped) {
+      updateBall(ball, state.cx, state.cy, state.rings, dt);
+      if (ball.escaped && !escaped) escaped = ball;
+    }
+  });
+
+  render(state.rings, state.balls, state.cx, state.cy);
+
+  if (escaped) {
+    declareWinner(escaped);
+  }
+}
+
+function startGame(names) {
+  state.lastNames = names;
+  resizeCanvas();
+
+  state.rings = makeRings(state.canvasSize);
+  state.balls = names.map((name, i) =>
+    makeBall(name, PALETTE[i % PALETTE.length], state.cx, state.cy, i, names.length)
+  );
+  state.winner = null;
+
+  showScreen('screen-game');
+  lastTs = performance.now();
+  state.animId = requestAnimationFrame(gameLoop);
+}
+
+function declareWinner(ball) {
+  cancelAnimationFrame(state.animId);
+  state.animId = null;
+  state.winner = ball;
+
+  document.getElementById('winner-name').textContent = ball.name;
+  document.getElementById('winner-name').style.color = '';
+
+  // resize confetti canvas to window
+  confCanvas.width  = window.innerWidth;
+  confCanvas.height = window.innerHeight;
+  confParticles = [];
+  showScreen('screen-winner');
+  runConfetti();
+}
+
+function stopConfetti() {
+  if (confAnimId) { cancelAnimationFrame(confAnimId); confAnimId = null; }
+  confParticles = [];
+  confCtx.clearRect(0, 0, confCanvas.width, confCanvas.height);
+}
+
+// ─────────────────────────────────────────────
+//  CANVAS SIZING
+// ─────────────────────────────────────────────
+function resizeCanvas() {
+  const size = Math.min(window.innerWidth, window.innerHeight) * 0.94;
+  canvas.width  = size;
+  canvas.height = size;
+  state.canvasSize = size;
+  state.cx = size / 2;
+  state.cy = size / 2;
+}
+
+// ─────────────────────────────────────────────
+//  UI
+// ─────────────────────────────────────────────
+function showScreen(id) {
+  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+}
+
+function parseNames(raw) {
+  return raw.split('\n').map(s => s.trim()).filter(s => s.length > 0);
+}
+
+function initEvents() {
+  const textarea  = document.getElementById('names-input');
+  const badge     = document.getElementById('count-badge');
+  const errorMsg  = document.getElementById('error-msg');
+  const btnStart  = document.getElementById('btn-start');
+
+  textarea.addEventListener('input', () => {
+    const names = parseNames(textarea.value);
+    badge.textContent = `참가자 ${names.length}명`;
+    errorMsg.textContent = '';
+    btnStart.disabled = names.length < 2;
+  });
+
+  btnStart.addEventListener('click', () => {
+    const names = parseNames(textarea.value);
+    if (names.length < 2) {
+      errorMsg.textContent = '참가자를 2명 이상 입력해주세요.';
+      return;
+    }
+    startGame(names);
+  });
+
+  document.getElementById('btn-stop').addEventListener('click', () => {
+    if (state.animId) { cancelAnimationFrame(state.animId); state.animId = null; }
+    showScreen('screen-input');
+  });
+
+  document.getElementById('btn-replay').addEventListener('click', () => {
+    stopConfetti();
+    if (state.lastNames.length >= 2) {
+      startGame(state.lastNames);
+    } else {
+      showScreen('screen-input');
+    }
+  });
+
+  document.getElementById('btn-new-game').addEventListener('click', () => {
+    stopConfetti();
+    showScreen('screen-input');
+  });
+
+  window.addEventListener('resize', () => {
+    if (state.phase === 'running') resizeCanvas();
+  });
+}
+
+// ─────────────────────────────────────────────
+//  INIT
+// ─────────────────────────────────────────────
+window.addEventListener('DOMContentLoaded', () => {
+  canvas    = document.getElementById('game-canvas');
+  ctx       = canvas.getContext('2d');
+  confCanvas = document.getElementById('confetti-canvas');
+  confCtx   = confCanvas.getContext('2d');
+
+  resizeCanvas();
+  initEvents();
+  showScreen('screen-input');
+});
+</script>
+</body>
+</html>
