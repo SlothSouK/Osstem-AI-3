@@ -1,0 +1,16 @@
+# ERP 자동화 의존성
+
+# Windows 앱 자동화
+pywinauto==0.6.8
+pyautogui==0.9.54
+
+# 엑셀 처리
+openpyxl==3.1.5
+pandas==2.2.3
+xlrd==2.0.1
+
+# 설정/환경변수
+python-dotenv==1.0.1
+
+# 스크린샷 지원 (pyautogui 의존)
+Pillow==10.4.0
