@@ -2,10 +2,12 @@
 
 ## 프로젝트 개요
 
-두 가지 독립적인 모듈로 구성된 프로젝트:
+네 가지 독립적인 모듈로 구성된 프로젝트:
 
 1. **챗봇 웹앱** (`backend/` + `frontend/`) — Claude API 기반 풀스택 채팅 앱
 2. **충당금 자동화** (`automation/`) — 해외관리2팀 ERP 업무 자동화 스크립트
+3. **웹 스크래퍼** (`ostconfin/`) — confinas.osstem.com 데이터 수집 → 엑셀 저장
+4. **SAP 채권 자동화** (`sapost/`) — FBL5N 미결항목 ALV 직독 → 엑셀 저장
 
 ---
 
@@ -41,6 +43,18 @@ Osstem-AI-3/
 │   │   ├── config.ini    셀렉터, 시트명, 옵션 설정
 │   │   └── .env          URL, 로그인 정보, 엑셀 경로 (git 제외)
 │   ├── scraper.py        실행 파일
+│   └── requirements.txt
+├── sapost/               SAP FBL5N 채권 자동화 (win32com + pandas)
+│   ├── main.py           전체 파이프라인 진입점
+│   ├── fbl5n_download.py FBL5N 전용 다운로드 스크립트
+│   ├── config/
+│   │   ├── config.ini    트랜잭션, 필드 ID, 경로 설정
+│   │   └── .env          SAP 로그인 정보 (git 제외)
+│   ├── src/
+│   │   ├── sap_controller.py   SAP GUI 연결/조작 (win32com)
+│   │   ├── data_processor.py   데이터 정제 (pandas)
+│   │   ├── template_writer.py  엑셀 양식 기입 (openpyxl)
+│   │   └── utils.py            로거, retry 데코레이터
 │   └── requirements.txt
 └── CLAUDE.md
 ```
@@ -84,6 +98,27 @@ python automation/main.py --month 202503 --skip-erp
 
 ---
 
+## SAP 채권 자동화 실행 (sapost)
+
+```bash
+# 의존성 설치
+pip install -r sapost/requirements.txt
+
+# FBL5N 미결항목 다운로드 (YYYYMM → 해당 월 말일 기준)
+python sapost/fbl5n_download.py --keydate 202603
+```
+
+동작:
+- `D:\해외관리실\해외법인\1. 임플라시우\채권명세서` 파일명 앞 7자리 숫자 = 고객계정
+- FBL5N → 회사코드 1000, 미결항목, 특별G/L거래+임시항목 체크 → ALV 직독
+- 전기일자 오름차순 정렬 후 `raw/{계정코드}-{YYYYMM}.xlsx` 저장
+
+실행 전 필수 설정:
+- `sapost/config/.env` — SAP_USER_ID, SAP_PASSWORD, SAP_CLIENT=100
+- SAP GUI 실행 중 + 스크립팅 활성화 필요 (Alt+F12 → Options → Scripting)
+
+---
+
 ## 자동화 모듈 수정 시 주의사항
 
 - **ERP 컨트롤 이름** (`config.ini [ERP]`): Inspect.exe 로 실제 ERP 창에서 확인
@@ -101,6 +136,7 @@ python automation/main.py --month 202503 --skip-erp
 | 프론트엔드 | React 18, TypeScript 5, Vite 5, Tailwind CSS 3 |
 | 자동화 | pywinauto 0.6, pyautogui 0.9, pandas 2.2, openpyxl 3.1 |
 | 웹 스크래핑 | Playwright 1.44, pandas 2.2, openpyxl 3.1 |
+| SAP 자동화 | pywin32 311, pandas 2.2, openpyxl 3.1, python-dotenv 1.0 |
 | Claude 모델 | claude-sonnet-4-6 |
 
 ---
