@@ -36,6 +36,12 @@ Osstem-AI-3/
 ├── .claude/
 │   └── commands/
 │       └── sync.md       /sync 커스텀 슬래시 커맨드
+├── ostconfin/            웹 데이터 수집 → 엑셀 저장 (Playwright + openpyxl)
+│   ├── config/
+│   │   ├── config.ini    셀렉터, 시트명, 옵션 설정
+│   │   └── .env          URL, 로그인 정보, 엑셀 경로 (git 제외)
+│   ├── scraper.py        실행 파일
+│   └── requirements.txt
 └── CLAUDE.md
 ```
 
@@ -94,6 +100,7 @@ python automation/main.py --month 202503 --skip-erp
 | 백엔드 | Python 3.11+, FastAPI 0.115, Anthropic SDK 0.34 |
 | 프론트엔드 | React 18, TypeScript 5, Vite 5, Tailwind CSS 3 |
 | 자동화 | pywinauto 0.6, pyautogui 0.9, pandas 2.2, openpyxl 3.1 |
+| 웹 스크래핑 | Playwright 1.44, pandas 2.2, openpyxl 3.1 |
 | Claude 모델 | claude-sonnet-4-6 |
 
 ---
