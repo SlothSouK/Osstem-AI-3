@@ -22,6 +22,9 @@ import calendar
 from datetime import date
 from pathlib import Path
 
+import pandas as pd
+import openpyxl
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from sapost.src.utils import get_config, setup_logger
@@ -40,12 +43,83 @@ import os
 # 헬퍼
 # ──────────────────────────────────────────────────────────
 
+def month_start(yyyymm: str) -> str:
+    """'202603' → '2026.03.01' (SAP 날짜 형식)"""
+    year  = int(yyyymm[:4])
+    month = int(yyyymm[4:6])
+    return f"{year}.{month:02d}.01"
+
+
 def month_end(yyyymm: str) -> str:
-    """'202603' → '2026.03.31' (SAP 날짜 형식 YYYY.MM.DD)"""
+    """'202603' → '2026.03.31' (SAP 날짜 형식)"""
     year  = int(yyyymm[:4])
     month = int(yyyymm[4:6])
     last_day = calendar.monthrange(year, month)[1]
     return f"{year}.{month:02d}.{last_day:02d}"
+
+
+def find_source_file(source_dir: Path, account: str) -> Path | None:
+    """source_dir 에서 파일명이 account(7자리)로 시작하는 엑셀 파일 반환"""
+    for f in source_dir.iterdir():
+        if f.is_file() and f.stem.startswith(account) and f.suffix in (".xlsx", ".xlsm"):
+            return f
+    return None
+
+
+def append_to_source_file(df: pd.DataFrame, dest_file: Path, config, logger):
+    """
+    df를 SG 컬럼 기준으로 분류하여 dest_file 의 해당 시트에 append.
+    - SG == 'M'           → sheet_misugeun_bal, sheet_misugeun
+    - SG != 'M', G/L 있음 → sheet_ar_bal, sheet_ar
+    """
+    sg_col      = config.get("APPEND", "sg_column", fallback="SG")
+    gl_col      = config.get("APPEND", "gl_account_column", fallback="G/L")
+    sh_mis_bal  = config.get("APPEND", "sheet_misugeun_bal",  fallback="미수금(잔액)")
+    sh_mis      = config.get("APPEND", "sheet_misugeun",      fallback="미수금")
+    sh_ar_bal   = config.get("APPEND", "sheet_ar_bal",        fallback="외화외상매출금(잔액)")
+    sh_ar       = config.get("APPEND", "sheet_ar",            fallback="외화외상매출금")
+
+    if sg_col not in df.columns:
+        logger.warning(f"  SG 컬럼 '{sg_col}' 없음 — append 건너뜀. 실제 컬럼: {list(df.columns)}")
+        return
+
+    # 분류
+    mask_m  = df[sg_col].astype(str).str.contains("M", na=False)
+    mask_gl = ~mask_m & df[gl_col].astype(str).str.strip().ne("") if gl_col in df.columns \
+              else ~mask_m
+
+    df_mis = df[mask_m].reset_index(drop=True)
+    df_ar  = df[mask_gl].reset_index(drop=True)
+
+    logger.info(f"  분류 결과 — 미수금: {len(df_mis)}행 / 외화외상매출금: {len(df_ar)}행")
+
+    wb = openpyxl.load_workbook(dest_file)
+
+    for sheet_name, data in [
+        (sh_mis_bal, df_mis),
+        (sh_mis,     df_mis),
+        (sh_ar_bal,  df_ar),
+        (sh_ar,      df_ar),
+    ]:
+        if sheet_name not in wb.sheetnames:
+            logger.warning(f"  시트 '{sheet_name}' 없음 — 건너뜀")
+            continue
+        if data.empty:
+            logger.info(f"  [{sheet_name}] 추가할 데이터 없음")
+            continue
+
+        ws = wb[sheet_name]
+        next_row = ws.max_row + 1
+
+        for _, row in data.iterrows():
+            for c_idx, value in enumerate(row, start=1):
+                ws.cell(row=next_row, column=c_idx).value = None if pd.isna(value) else value
+            next_row += 1
+
+        logger.info(f"  [{sheet_name}] {len(data)}행 추가 완료 (다음 행: {ws.max_row})")
+
+    wb.save(dest_file)
+    logger.info(f"  저장 완료: {dest_file.name}")
 
 
 def get_customer_accounts(source_dir: Path, logger) -> list[str]:
@@ -85,17 +159,19 @@ class FBL5NDownloader:
 
         # config.ini 에서 필드 ID 로드
         self.transaction      = config.get("SAP", "transaction", fallback="FBL5N")
-        self.customer_field   = config.get("SAP", "customer_field_id")
-        self.company_code     = config.get("SAP", "company_code", fallback="1000")
+        self.customer_field     = config.get("SAP", "customer_field_id")
+        self.company_code       = config.get("SAP", "company_code", fallback="1000")
         self.company_code_field = config.get("SAP", "company_code_field")
-        self.keydate_field    = config.get("SAP", "keydate_field_id")
-        self.open_items_radio = config.get("SAP", "open_items_radio")
-        self.special_gl_chk   = config.get("SAP", "special_gl_chk")
-        self.noted_items_chk  = config.get("SAP", "noted_items_chk")
-        self.posting_date_col = config.get("SAP", "posting_date_col", fallback="BUDAT")
-        self.execute_vkey     = config.getint("SAP", "execute_vkey", fallback=8)
+        self.all_items_radio    = config.get("SAP", "all_items_radio")
+        self.budat_low_field    = config.get("SAP", "budat_low_field")
+        self.budat_high_field   = config.get("SAP", "budat_high_field")
+        self.special_gl_chk     = config.get("SAP", "special_gl_chk")
+        self.noted_items_chk    = config.get("SAP", "noted_items_chk")
+        self.posting_date_col   = config.get("SAP", "posting_date_col", fallback="BUDAT")
+        self.execute_vkey       = config.getint("SAP", "execute_vkey", fallback=8)
 
-        self.raw_dir = Path(config.get("PATHS", "raw_dir"))
+        self.raw_dir    = Path(config.get("PATHS", "raw_dir"))
+        self.source_dir = Path(config.get("PATHS", "source_dir"))
         self.raw_dir.mkdir(parents=True, exist_ok=True)
 
     def connect(self):
@@ -106,14 +182,14 @@ class FBL5NDownloader:
         self.session = connection.Children(0)
         self.logger.info("SAP GUI 세션 연결 완료")
 
-    def run_all(self, accounts: list[str], keydate_str: str, yyyymm: str):
+    def run_all(self, accounts: list[str], budat_low: str, budat_high: str, yyyymm: str):
         """모든 고객계정에 대해 FBL5N 실행 → 다운로드"""
         success, failed = [], []
 
         for i, account in enumerate(accounts, 1):
-            self.logger.info(f"[{i}/{len(accounts)}] 계정: {account}  기준일: {keydate_str}")
+            self.logger.info(f"[{i}/{len(accounts)}] 계정: {account}  전기일: {budat_low} ~ {budat_high}")
             try:
-                dest = self._run_single(account, keydate_str, yyyymm)
+                dest = self._run_single(account, budat_low, budat_high, yyyymm)
                 success.append(account)
                 self.logger.info(f"  → 저장 완료: {dest.name}")
             except Exception as e:
@@ -126,13 +202,13 @@ class FBL5NDownloader:
         if failed:
             self.logger.warning(f"실패 계정: {failed}")
 
-    def _run_single(self, account: str, keydate_str: str, yyyymm: str) -> Path:
+    def _run_single(self, account: str, budat_low: str, budat_high: str, yyyymm: str) -> Path:
         """단일 고객계정 FBL5N 실행 → 저장 → 파일 경로 반환"""
         # 1) FBL5N 트랜잭션 이동
         self._navigate_to_fbl5n()
 
         # 2) 선택 화면 입력
-        self._fill_selection_screen(account, keydate_str)
+        self._fill_selection_screen(account, budat_low, budat_high)
 
         # 3) 실행 (F8)
         self.session.findById("wnd[0]").sendVKey(self.execute_vkey)
@@ -141,7 +217,15 @@ class FBL5NDownloader:
 
         # 4) ALV 그리드에서 직접 읽기 → pandas 정렬 → 엑셀 저장
         dest = self.raw_dir / f"{account}-{yyyymm}.xlsx"
-        self._read_grid_and_save(dest)
+        df = self._read_grid_and_save(dest)
+
+        # 5) source_dir 의 원본 파일에 append
+        source_file = find_source_file(self.source_dir, account)
+        if source_file:
+            self.logger.info(f"  원본 파일 발견: {source_file.name}")
+            append_to_source_file(df, source_file, self.config, self.logger)
+        else:
+            self.logger.warning(f"  원본 파일 없음 — append 건너뜀 (계정: {account})")
 
         return dest
 
@@ -152,8 +236,8 @@ class FBL5NDownloader:
         self.session.findById("wnd[0]").sendVKey(0)
         time.sleep(2)
 
-    def _fill_selection_screen(self, account: str, keydate_str: str):
-        """FBL5N 선택 화면: 고객계정, 기준일, 체크박스 입력"""
+    def _fill_selection_screen(self, account: str, budat_low: str, budat_high: str):
+        """FBL5N 선택 화면: 고객계정, 전기일 기간, 체크박스 입력"""
         s = self.session
 
         # 고객계정
@@ -163,34 +247,34 @@ class FBL5NDownloader:
         try:
             s.findById(self.company_code_field).text = self.company_code
         except Exception as e:
-            self.logger.warning(f"  회사코드 입력 실패 (ID 확인 필요): {e}")
+            self.logger.warning(f"  회사코드 입력 실패: {e}")
 
-        # 미결항목 라디오 선택
+        # 모든 항목 라디오 선택
         try:
-            s.findById(self.open_items_radio).select()
+            s.findById(self.all_items_radio).select()
         except Exception as e:
-            self.logger.warning(f"  미결항목 라디오 선택 실패 (ID 확인 필요): {e}")
+            self.logger.warning(f"  모든 항목 라디오 선택 실패: {e}")
 
-        # 기준일자
-        s.findById(self.keydate_field).text = keydate_str
+        # 전기일 기간
+        s.findById(self.budat_low_field).text  = budat_low
+        s.findById(self.budat_high_field).text = budat_high
 
         # 특별G/L거래 체크
         try:
             s.findById(self.special_gl_chk).selected = True
         except Exception as e:
-            self.logger.warning(f"  특별G/L 체크 실패 (ID 확인 필요): {e}")
+            self.logger.warning(f"  특별G/L 체크 실패: {e}")
 
         # 임시항목 체크
         try:
             s.findById(self.noted_items_chk).selected = True
         except Exception as e:
-            self.logger.warning(f"  임시항목 체크 실패 (ID 확인 필요): {e}")
+            self.logger.warning(f"  임시항목 체크 실패: {e}")
 
-        self.logger.info(f"  선택 화면 입력 완료 (계정: {account}, 기준일: {keydate_str})")
+        self.logger.info(f"  선택 화면 입력 완료 (계정: {account}, 전기일: {budat_low} ~ {budat_high})")
 
-    def _read_grid_and_save(self, dest: Path):
-        """ALV 그리드 직접 읽기 → 전기일자 오름차순 정렬 → 엑셀 저장"""
-        import pandas as pd
+    def _read_grid_and_save(self, dest: Path) -> pd.DataFrame:
+        """ALV 그리드 직접 읽기 → 전기일자 오름차순 정렬 → 엑셀 저장 → DataFrame 반환"""
 
         grid_id = self.config.get("SAP", "grid_id")
         grid = self.session.findById(grid_id)
@@ -242,6 +326,8 @@ class FBL5NDownloader:
         df.to_excel(dest, index=False)
         self.logger.info(f"  엑셀 저장 완료: {dest}  ({len(df)}행)")
 
+        return df
+
     def _go_back_to_start(self):
         """오류 발생 시 초기 화면으로 복귀"""
         try:
@@ -271,14 +357,15 @@ def parse_args():
 
 def main():
     args = parse_args()
-    yyyymm = args.keydate
-    keydate_str = month_end(yyyymm)
+    yyyymm    = args.keydate
+    budat_low  = month_start(yyyymm)
+    budat_high = month_end(yyyymm)
 
     config = get_config()
     logger = setup_logger("sapost.fbl5n", config)
 
     logger.info("=" * 60)
-    logger.info(f"FBL5N 다운로드 시작 | 기준일: {keydate_str}")
+    logger.info(f"FBL5N 다운로드 시작 | 전기일: {budat_low} ~ {budat_high}")
     logger.info("=" * 60)
 
     # 고객계정 목록 수집
@@ -298,7 +385,7 @@ def main():
     downloader = FBL5NDownloader(config, logger)
     try:
         downloader.connect()
-        downloader.run_all(accounts, keydate_str, yyyymm)
+        downloader.run_all(accounts, budat_low, budat_high, yyyymm)
     finally:
         downloader.close()
 

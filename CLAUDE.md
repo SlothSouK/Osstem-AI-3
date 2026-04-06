@@ -110,8 +110,9 @@ python sapost/fbl5n_download.py --keydate 202603
 
 동작:
 - `D:\해외관리실\해외법인\1. 임플라시우\채권명세서` 파일명 앞 7자리 숫자 = 고객계정
-- FBL5N → 회사코드 1000, 미결항목, 특별G/L거래+임시항목 체크 → ALV 직독
+- FBL5N → 회사코드 1000, 모든 항목, 특별G/L거래+임시항목 체크, 전기일 기간 조회
 - 전기일자 오름차순 정렬 후 `raw/{계정코드}-{YYYYMM}.xlsx` 저장
+- SG 컬럼 = M → 미수금(잔액)/미수금 시트 append, 그 외 G/L 있음 → 외화외상매출금 시트 append
 
 실행 전 필수 설정:
 - `sapost/config/.env` — SAP_USER_ID, SAP_PASSWORD, SAP_CLIENT=100
