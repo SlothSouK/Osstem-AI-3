@@ -121,13 +121,27 @@ def _parse_sap_date(val) -> date | None:
 
 
 def _parse_amount(val) -> float | None:
-    """총계정원장 텍스트 ('1,234.56' 또는 '1.234,56') → float. 빈값이면 None."""
+    """총계정원장 텍스트 → float. 빈값이면 None.
+    지원 형식:
+      '1,234.56'  — 영미식
+      '1.234,56'  — 유럽식
+      '1234.56-'  — 후행 마이너스 (일부 SAP 로케일)
+    """
     s = str(val).strip() if val is not None else ""
     if not s:
         return None
+    # 후행 마이너스 → 선행 마이너스로 정규화
+    trailing_minus = s.endswith("-")
+    if trailing_minus:
+        s = "-" + s[:-1]
     try:
-        # 천단위 구분자 쉼표 제거
         cleaned = s.replace(",", "").replace(" ", "")
+        return float(cleaned)
+    except ValueError:
+        pass
+    # 유럽식: 마지막 ',' 가 소수점 구분자인 경우 ('1.234,56')
+    try:
+        cleaned = s.replace(".", "").replace(",", ".").replace(" ", "")
         return float(cleaned)
     except Exception:
         return None
@@ -324,11 +338,7 @@ def append_to_source_file(df: pd.DataFrame, dest_file: Path, config, logger, yyy
     df_ar  = df[mask_gl].reset_index(drop=True)
     logger.info(f"  분류 결과 — 미수금: {len(df_mis)}행 / 외화외상매출금: {len(df_ar)}행")
 
-    # 조회 월 말일
-    yr, mo = int(yyyymm[:4]), int(yyyymm[4:6])
-    last_day_date = date(yr, mo, calendar.monthrange(yr, mo)[1])
-
-    wb = openpyxl.load_workbook(dest_file)
+    wb = openpyxl.load_workbook(dest_file, keep_links=True)
 
     def resolve_sheet(candidates: list[str]) -> str | None:
         for name in candidates:
@@ -356,14 +366,10 @@ def append_to_source_file(df: pd.DataFrame, dest_file: Path, config, logger, yyy
         else:
             header_row = hdr_default
 
-        # 외화외상매출금(잔액) 계열 → D6 = 조회 월 말일
-        if is_ar_bal:
-            ws["D6"] = last_day_date
-
         # 헤더 행에서 대상 열 인덱스 수집 (alias 사전 사용)
         col_idx = {
             k: _find_col_idx(ws, header_row, COL_ALIASES[k])
-            for k in ("jijung", "jeungbil", "elapsed", "text", "amount", "currency", "ar_balance")
+            for k in ("jijung", "jeungbil", "elapsed", "text", "amount", "currency", "ar_balance", "gigsanghwan")
         }
         col_idx["mangil"] = _find_col_idx(ws, header_row, COL_ALIASES["mangil"]) if is_bal_sheet else None
         logger.debug(f"  [{sheet_name}] header_row={header_row}, 열 인덱스: {col_idx}")
@@ -407,8 +413,7 @@ def append_to_source_file(df: pd.DataFrame, dest_file: Path, config, logger, yyy
                 v = row.get(actual_currency_col, "")
                 ws.cell(row=r, column=col_idx["currency"]).value = None if pd.isna(v) else v
 
-            if col_idx["ar_balance"]:
-                _copy_cell_above(ws, r, col_idx["ar_balance"], r - 1)
+            # ar_balance 수식은 offset 삭제 완료 후 apply_elapsed_formulas에서 일괄 처리
 
             if col_idx["mangil"] and actual_net_due_col:
                 _mc = ws.cell(row=r, column=col_idx["mangil"])
@@ -492,7 +497,7 @@ def append_offset_to_source_file(df_offset: pd.DataFrame, dest_file: Path, confi
 
     actual_budat_offset = _find_df_col(df_offset, config.get("APPEND", "col_budat", fallback="전기일"))
 
-    wb = openpyxl.load_workbook(dest_file)
+    wb = openpyxl.load_workbook(dest_file, keep_links=True)
 
     def resolve_sheet(candidates: list[str]) -> str | None:
         for name in candidates:
@@ -608,9 +613,8 @@ def append_offset_to_source_file(df_offset: pd.DataFrame, dest_file: Path, confi
 def apply_elapsed_formulas(dest_file: Path, config, budat_high_date: date, logger):
     """
     경과기간 수식을 append·offset 완료 후 마지막에 일괄 기입.
-    - 기존 경과기간 수식에서 헤더 위쪽(고정 위치)을 참조하는 셀을 찾아
-      budat_high_date 를 기입 (수식 자체는 변경하지 않음)
-    - 새로 추가된 행에는 기존 수식 패턴을 행 오프셋만 조정해 복사
+    - D6 셀에 budat_high_date 기입 (모든 시트)
+    - 경과기간 비어 있는 새 행: =DATEDIF(증빙일셀, $D$6, "Y")
     """
     hdr_default = config.getint("APPEND", "header_row_default", fallback=4)
     hdr_ar_bal  = config.getint("APPEND", "header_row_ar_bal",  fallback=8)
@@ -622,23 +626,7 @@ def apply_elapsed_formulas(dest_file: Path, config, budat_high_date: date, logge
         ([s.strip() for s in config.get("APPEND", "sheet_ar",           fallback="외화외상매출금").split("|")], False),
     ]
 
-    wb = openpyxl.load_workbook(dest_file)
-
-    def find_fixed_ref_cells(formula: str, data_start_row: int) -> list[tuple[str, int, int]]:
-        """
-        수식에서 데이터 영역 위쪽(row < data_start_row)을 참조하는 셀 주소 반환.
-        반환: [(원본참조문자열, 행번호, 열번호), ...]
-        """
-        results = []
-        for m in re.finditer(r'\$?([A-Z]+)\$?(\d+)', formula, re.IGNORECASE):
-            row_num = int(m.group(2))
-            if row_num < data_start_row:
-                try:
-                    col_num = column_index_from_string(m.group(1).upper())
-                    results.append((m.group(0), row_num, col_num))
-                except Exception:
-                    pass
-        return results
+    wb = openpyxl.load_workbook(dest_file, keep_links=True)
 
     modified = False
     for candidates, is_ar_bal in all_candidates:
@@ -649,60 +637,58 @@ def apply_elapsed_formulas(dest_file: Path, config, budat_high_date: date, logge
         ws = wb[sheet_name]
         hdr = (_find_header_row(ws, COL_ALIASES["anchor"]) or hdr_ar_bal) if is_ar_bal else hdr_default
 
-        elapsed_idx  = _find_col_idx(ws, hdr, COL_ALIASES["elapsed"])
-        jeungbil_idx = _find_col_idx(ws, hdr, COL_ALIASES["jeungbil"])
-        jijung_idx   = _find_col_idx(ws, hdr, COL_ALIASES["jijung"])
-        anchor_idx   = jeungbil_idx or jijung_idx
-        if not elapsed_idx or not anchor_idx:
+        elapsed_idx    = _find_col_idx(ws, hdr, COL_ALIASES["elapsed"])
+        jeungbil_idx   = _find_col_idx(ws, hdr, COL_ALIASES["jeungbil"])
+        jijung_idx     = _find_col_idx(ws, hdr, COL_ALIASES["jijung"])
+        amount_idx     = _find_col_idx(ws, hdr, COL_ALIASES["amount"])
+        gigsanghwan_idx= _find_col_idx(ws, hdr, COL_ALIASES["gigsanghwan"])
+        ar_balance_idx = _find_col_idx(ws, hdr, COL_ALIASES["ar_balance"])
+        anchor_idx     = jeungbil_idx or jijung_idx
+        if not anchor_idx:
             continue
 
         last_data_row = _find_last_data_row(ws, hdr, anchor_idx)
         if last_data_row <= hdr:
             continue
 
-        # 새로 추가된 행: 경과기간 비어 있고 anchor 값 있는 행
-        rows_to_fill = [
+        # anchor 값 있는 모든 데이터 행 (삭제 후 실제 행 번호 기준)
+        all_data_rows = [
             r for r in range(hdr + 1, last_data_row + 1)
             if ws.cell(row=r, column=anchor_idx).value is not None
-            and ws.cell(row=r, column=elapsed_idx).value in (None, "")
         ]
-        if not rows_to_fill:
+        if not all_data_rows:
             continue
 
-        # 참조 수식: 빈 행 직전에서 위로 탐색
-        ref_formula: str | None = None
-        ref_row: int | None = None
-        for r in range(rows_to_fill[0] - 1, hdr, -1):
-            v = ws.cell(row=r, column=elapsed_idx).value
-            if isinstance(v, str) and v.startswith("="):
-                ref_formula = v
-                ref_row = r
-                break
+        # D6에 조회 종료일 기입
+        _d6 = ws.cell(row=6, column=4)
+        if type(_d6).__name__ != "MergedCell":
+            _d6.value = budat_high_date  # type: ignore[assignment]
+            logger.info(f"  [{sheet_name}] D6 → {budat_high_date} 기입")
 
-        if not ref_formula or ref_row is None:
-            logger.debug(f"  [{sheet_name}] 경과기간 참조 수식 없음 — 건너뜀")
-            continue
+        # 경과기간 수식 전체 재기입: =DATEDIF(증빙일셀, $D$6, "Y")
+        if elapsed_idx and jeungbil_idx:
+            jeungbil_col = get_column_letter(jeungbil_idx)
+            cnt = 0
+            for r in all_data_rows:
+                _cell = ws.cell(row=r, column=elapsed_idx)
+                if type(_cell).__name__ != "MergedCell":
+                    _cell.value = f'=DATEDIF({jeungbil_col}{r},$D$6,"Y")'  # type: ignore[assignment]
+                    cnt += 1
+            logger.info(f"  [{sheet_name}] 경과기간 수식 {cnt}행 기입")
+            modified = True
 
-        # 수식이 참조하는 고정 셀(헤더 위쪽)에 budat_high_date 기입
-        fixed_refs = find_fixed_ref_cells(ref_formula, hdr + 1)
-        date_cells_updated: list[str] = []
-        for _, row_num, col_num in fixed_refs:
-            _c = ws.cell(row=row_num, column=col_num)
-            if type(_c).__name__ != "MergedCell":
-                _c.value = budat_high_date  # type: ignore[assignment]
-                date_cells_updated.append(f"{get_column_letter(col_num)}{row_num}")
-        if date_cells_updated:
-            logger.info(f"  [{sheet_name}] 고정 참조 셀 {date_cells_updated} → {budat_high_date} 기입")
-
-        # 새 행에 수식 복사 (수식 자체는 그대로, 행 오프셋만 조정)
-        for r in rows_to_fill:
-            new_formula = _adjust_formula(ref_formula, r - ref_row)
-            _cell = ws.cell(row=r, column=elapsed_idx)
-            if type(_cell).__name__ != "MergedCell":
-                _cell.value = new_formula  # type: ignore[assignment]
-
-        logger.info(f"  [{sheet_name}] 경과기간 수식 {len(rows_to_fill)}행 기입")
-        modified = True
+        # 상환 후 잔액 수식 전체 재기입: =금액셀 - 기상환액셀
+        if ar_balance_idx and amount_idx and gigsanghwan_idx:
+            amt_col = get_column_letter(amount_idx)
+            gig_col = get_column_letter(gigsanghwan_idx)
+            cnt = 0
+            for r in all_data_rows:
+                _cell = ws.cell(row=r, column=ar_balance_idx)
+                if type(_cell).__name__ != "MergedCell":
+                    _cell.value = f"={amt_col}{r}-{gig_col}{r}"  # type: ignore[assignment]
+                    cnt += 1
+            logger.info(f"  [{sheet_name}] 상환 후 잔액 수식 {cnt}행 기입")
+            modified = True
 
     if modified:
         wb.save(dest_file)
