@@ -14,11 +14,13 @@ FBL5N 채권 미결항목 다운로드 스크립트
   3. 전기일자 오름차순 정렬 후 엑셀 로컬 저장
   4. raw_dir 에 {계정코드}-{YYYYMM}.xlsx 로 저장
 """
+import re
 import sys
 import time
 import shutil
 import argparse
 import calendar
+from copy import copy as _copy_obj
 from datetime import date
 from pathlib import Path
 
@@ -66,60 +68,470 @@ def find_source_file(source_dir: Path, account: str) -> Path | None:
     return None
 
 
-def append_to_source_file(df: pd.DataFrame, dest_file: Path, config, logger):
-    """
-    df를 SG 컬럼 기준으로 분류하여 dest_file 의 해당 시트에 append.
-    - SG == 'M'           → sheet_misugeun_bal, sheet_misugeun
-    - SG != 'M', G/L 있음 → sheet_ar_bal, sheet_ar
-    """
-    sg_col      = config.get("APPEND", "sg_column", fallback="SG")
-    gl_col      = config.get("APPEND", "gl_account_column", fallback="G/L")
-    sh_mis_bal  = config.get("APPEND", "sheet_misugeun_bal",  fallback="미수금(잔액)")
-    sh_mis      = config.get("APPEND", "sheet_misugeun",      fallback="미수금")
-    sh_ar_bal   = config.get("APPEND", "sheet_ar_bal",        fallback="외화외상매출금(잔액)")
-    sh_ar       = config.get("APPEND", "sheet_ar",            fallback="외화외상매출금")
+def _parse_sap_date(val) -> date | None:
+    """SAP 날짜 텍스트 'YYYY.MM.DD' → Python date. 빈값이면 None."""
+    s = str(val).strip() if val is not None else ""
+    if not s:
+        return None
+    try:
+        parts = s.split(".")
+        return date(int(parts[0]), int(parts[1]), int(parts[2]))
+    except Exception:
+        return None
 
-    if sg_col not in df.columns:
-        logger.warning(f"  SG 컬럼 '{sg_col}' 없음 — append 건너뜀. 실제 컬럼: {list(df.columns)}")
+
+def _parse_amount(val) -> float | None:
+    """총계정원장 텍스트 ('1,234.56' 또는 '1.234,56') → float. 빈값이면 None."""
+    s = str(val).strip() if val is not None else ""
+    if not s:
+        return None
+    try:
+        # 천단위 구분자 쉼표 제거
+        cleaned = s.replace(",", "").replace(" ", "")
+        return float(cleaned)
+    except Exception:
+        return None
+
+
+def _adjust_formula(formula: str, row_offset: int) -> str:
+    """수식의 상대 행 참조만 row_offset만큼 조정. 절대 참조($행)는 유지."""
+    if not isinstance(formula, str) or not formula.startswith("="):
+        return formula
+
+    def replacer(m):
+        col_ref   = m.group(1)   # 열 참조 (예: "A" 또는 "$A")
+        dollar_row = m.group(2)  # 행 절대 참조 여부 ("$" 또는 "")
+        row_num    = m.group(3)  # 행 번호 문자열
+        if dollar_row:           # 절대 행 참조 → 변경 안 함
+            return m.group(0)
+        return f"{col_ref}{int(row_num) + row_offset}"
+
+    return re.sub(r"(\$?[A-Z]+)(\$?)(\d+)", replacer, formula)
+
+
+def _find_df_col(df: pd.DataFrame, keyword: str) -> str | None:
+    """DataFrame 컬럼명 중 keyword로 시작하는 첫 번째 컬럼명 반환. 없으면 None."""
+    for col in df.columns:
+        if str(col).startswith(keyword):
+            return col
+    return None
+
+
+# 컬럼 역할별 헤더 이름 alias (한국어·영어·스페인어 혼용 파일 대응)
+COL_ALIASES: dict[str, list[str]] = {
+    "anchor":       ["지정", "DIV", "Sap code", "JE No."],
+    "jijung":       ["지정", "DIV", "Sap code", "JE No."],
+    "jeungbil":     ["증빙일", "DATE", "Date"],
+    "elapsed":      ["경과기간", "Expiration period"],
+    "text":         ["텍스트", "REMARK", "Text", "TEXT", "Contents"],
+    "amount":       ["금액", "AMT", "Amount", "Amt.", "AMOUNT"],
+    "currency":     ["통화", "CUR", "Currency"],
+    "gigsanghwan":  ["기상환액", "상환액", "REPAYMENT", "Repayment", "Pay back", "REPAY"],
+    "ar_balance":   ["상환 후 잔액", "SALDO", "Balance after repayment", "Balance", "BALANCE"],
+    "sanghwanil":   ["상환일", "상환일(반제전표)", "PAYMENT DATE", "Repayment date"],
+    "banjejeunpyo": ["반제전표", "반제전표번호", "Document number"],
+    "mangil":       ["만기일", "EXPIRATION DATE"],
+}
+
+
+def _find_col_idx(ws, header_row: int, col_name: "str | list[str]") -> int | None:
+    """헤더 행에서 col_name(단일 문자열 또는 alias 목록)과 일치하는 열 인덱스 반환."""
+    aliases = col_name if isinstance(col_name, list) else [col_name]
+    for cell in ws[header_row]:
+        if cell.value and str(cell.value).strip() in aliases:
+            return cell.column
+    return None
+
+
+def _find_header_row(ws, anchor_aliases: list[str], max_scan: int = 15) -> int | None:
+    """anchor_aliases 중 하나가 있는 행 번호 반환. 없으면 None."""
+    for r in range(1, max_scan + 1):
+        for c in range(1, 30):
+            val = ws.cell(r, c).value
+            if val and str(val).strip() in anchor_aliases:
+                return r
+    return None
+
+
+def _find_last_data_row(ws, header_row: int, anchor_col_idx: int) -> int:
+    """anchor_col_idx 컬럼에서 마지막 데이터가 있는 행 번호 반환. 없으면 header_row."""
+    for r in range(ws.max_row, header_row, -1):
+        if ws.cell(row=r, column=anchor_col_idx).value is not None:
+            return r
+    return header_row
+
+
+def _copy_row_format(ws, src_row: int, dst_row: int, max_col: int):
+    """src_row 셀 서식(테두리·폰트·채우기·정렬·숫자형식)을 dst_row에 복사."""
+    for col in range(1, max_col + 1):
+        src = ws.cell(row=src_row, column=col)
+        dst = ws.cell(row=dst_row, column=col)
+        if src.has_style:
+            dst.font        = _copy_obj(src.font)
+            dst.border      = _copy_obj(src.border)
+            dst.fill        = _copy_obj(src.fill)
+            dst.alignment   = _copy_obj(src.alignment)
+            dst.number_format = src.number_format
+
+
+def _expand_formula_range(formula: str, new_end_row: int) -> str:
+    """수식 내 범위 참조(A1:A100)의 끝 행이 new_end_row보다 작으면 확장."""
+    if not isinstance(formula, str) or not formula.startswith("="):
+        return formula
+
+    def replacer(m):
+        end_row = int(m.group(4))
+        if end_row >= new_end_row:
+            return m.group(0)
+        return f"{m.group(1)}:{m.group(2)}{m.group(3)}{new_end_row}"
+
+    # 패턴: $?[A-Z]+$?\d+ : $?[A-Z]+ $? \d+
+    return re.sub(
+        r'(\$?[A-Z]+\$?\d+):(\$?[A-Z]+)(\$?)(\d+)',
+        replacer,
+        formula,
+        flags=re.IGNORECASE,
+    )
+
+
+def _copy_cell_above(ws, new_row: int, col_idx: int, offset_from: int):
+    """
+    new_row 바로 위(new_row-1) 셀의 수식/값을 복사하여 new_row에 기입.
+    수식이면 행 참조를 +1 조정, 값이면 그대로 복사.
+    offset_from: 수식 행 참조 조정 기준이 되는 원본 행 (= new_row - 1)
+    """
+    src = ws.cell(row=new_row - 1, column=col_idx).value
+    if src is None:
+        return
+    if isinstance(src, str) and src.startswith("="):
+        ws.cell(row=new_row, column=col_idx).value = _adjust_formula(src, 1)
+    else:
+        ws.cell(row=new_row, column=col_idx).value = src
+
+
+def append_to_source_file(df: pd.DataFrame, dest_file: Path, config, logger, yyyymm: str):
+    """
+    df를 SG 컬럼 기준으로 분류하여 dest_file 의 해당 시트에 지정 열만 append.
+
+    열 매핑:
+      지정   ← SAP col_jijung
+      증빙일  ← SAP col_budat  (YYYY-MM-DD 날짜 변환, 반제일 있는 행 제외)
+      경과기간← 기존 마지막 행 수식 복사
+      텍스트 ← SAP col_text
+      금액   ← SAP col_gl_amount (숫자 변환)
+      통화   ← SAP col_currency
+
+    시트별 헤더 행:
+      외화외상매출금(잔액) → 8행,  나머지 → 4행
+    외화외상매출금(잔액) D6 → 조회 월 말일로 설정
+    """
+    sg_col     = config.get("APPEND", "sg_column",          fallback="SG")
+    gl_col     = config.get("APPEND", "gl_account_column",  fallback="G/L 계정")
+    sh_mis_bal_candidates = [s.strip() for s in config.get("APPEND", "sheet_misugeun_bal", fallback="미수금(잔액)").split("|")]
+    sh_mis_candidates     = [s.strip() for s in config.get("APPEND", "sheet_misugeun",     fallback="미수금").split("|")]
+    sh_ar_bal_candidates  = [s.strip() for s in config.get("APPEND", "sheet_ar_bal",       fallback="외화외상매출금(잔액)").split("|")]
+    sh_ar_candidates      = [s.strip() for s in config.get("APPEND", "sheet_ar",           fallback="외화외상매출금").split("|")]
+
+    hdr_default = config.getint("APPEND", "header_row_default", fallback=4)
+    hdr_ar_bal  = config.getint("APPEND", "header_row_ar_bal",  fallback=8)
+
+    # SAP 컬럼명
+    sap_jijung       = config.get("APPEND", "col_jijung",       fallback="지정")
+    sap_budat        = config.get("APPEND", "col_budat",        fallback="전기일")
+    sap_augdt        = config.get("APPEND", "col_augdt",        fallback="반제일")
+    sap_text         = config.get("APPEND", "col_text",         fallback="텍스트")
+    sap_gl_amount    = config.get("APPEND", "col_gl_amount",    fallback="총계정원장금액")
+    sap_currency     = config.get("APPEND", "col_currency",     fallback="통화")
+    sap_net_due_date = config.get("APPEND", "col_net_due_date", fallback="순만기일")
+
+    formula_row_offsets = [int(s.strip()) for s in config.get("APPEND", "formula_rows_offset", fallback="1,2").split(",")]
+
+    # SAP 컬럼명: 키워드 포함 방식으로 실제 컬럼명 탐색
+    actual_sg_col     = _find_df_col(df, sg_col)
+    actual_gl_col     = _find_df_col(df, gl_col)
+    actual_augdt_col  = _find_df_col(df, sap_augdt)
+    actual_jijung_col = _find_df_col(df, sap_jijung)
+    actual_budat_col  = _find_df_col(df, sap_budat)
+    actual_text_col   = _find_df_col(df, sap_text)
+    actual_amount_col = _find_df_col(df, sap_gl_amount)
+    actual_currency_col  = _find_df_col(df, sap_currency)
+    actual_net_due_col   = _find_df_col(df, sap_net_due_date)
+
+    logger.debug(f"  컬럼 매핑: SG={actual_sg_col}, 반제일={actual_augdt_col}, "
+                 f"전기일={actual_budat_col}, 금액={actual_amount_col}")
+
+    if actual_sg_col is None:
+        logger.warning(f"  SG 컬럼 키워드 '{sg_col}' 없음 — append 건너뜀. 실제 컬럼: {list(df.columns)}")
         return
 
+    # 반제일 있는 행 제외
+    if actual_augdt_col:
+        before = len(df)
+        df = df[df[actual_augdt_col].astype(str).str.strip() == ""].reset_index(drop=True)
+        skipped = before - len(df)
+        if skipped:
+            logger.info(f"  반제일 있는 행 {skipped}건 제외")
+
     # 분류
-    mask_m  = df[sg_col].astype(str).str.contains("M", na=False)
-    mask_gl = ~mask_m & df[gl_col].astype(str).str.strip().ne("") if gl_col in df.columns \
-              else ~mask_m
+    mask_m  = df[actual_sg_col].astype(str).str.contains("M", na=False)
+    mask_gl = (~mask_m & df[actual_gl_col].astype(str).str.strip().ne("")) \
+              if actual_gl_col else ~mask_m
 
     df_mis = df[mask_m].reset_index(drop=True)
     df_ar  = df[mask_gl].reset_index(drop=True)
-
     logger.info(f"  분류 결과 — 미수금: {len(df_mis)}행 / 외화외상매출금: {len(df_ar)}행")
+
+    # 조회 월 말일
+    yr, mo = int(yyyymm[:4]), int(yyyymm[4:6])
+    last_day_date = date(yr, mo, calendar.monthrange(yr, mo)[1])
 
     wb = openpyxl.load_workbook(dest_file)
 
-    for sheet_name, data in [
-        (sh_mis_bal, df_mis),
-        (sh_mis,     df_mis),
-        (sh_ar_bal,  df_ar),
-        (sh_ar,      df_ar),
+    def resolve_sheet(candidates: list[str]) -> str | None:
+        for name in candidates:
+            if name in wb.sheetnames:
+                return name
+        return None
+
+    for candidates, data, is_ar_bal, is_bal_sheet in [
+        (sh_mis_bal_candidates, df_mis, False, True),
+        (sh_mis_candidates,     df_mis, False, False),
+        (sh_ar_bal_candidates,  df_ar,  True,  True),
+        (sh_ar_candidates,      df_ar,  False, False),
     ]:
-        if sheet_name not in wb.sheetnames:
-            logger.warning(f"  시트 '{sheet_name}' 없음 — 건너뜀")
+        sheet_name = resolve_sheet(candidates)
+        if sheet_name is None:
+            logger.warning(f"  시트 없음 (후보: {candidates}) — 건너뜀")
             continue
         if data.empty:
             logger.info(f"  [{sheet_name}] 추가할 데이터 없음")
             continue
 
         ws = wb[sheet_name]
-        next_row = ws.max_row + 1
+        if is_ar_bal:
+            header_row = _find_header_row(ws, COL_ALIASES["anchor"]) or hdr_ar_bal
+        else:
+            header_row = hdr_default
 
-        for _, row in data.iterrows():
-            for c_idx, value in enumerate(row, start=1):
-                ws.cell(row=next_row, column=c_idx).value = None if pd.isna(value) else value
-            next_row += 1
+        # 외화외상매출금(잔액) 계열 → D6 = 조회 월 말일
+        if is_ar_bal:
+            ws["D6"] = last_day_date
 
-        logger.info(f"  [{sheet_name}] {len(data)}행 추가 완료 (다음 행: {ws.max_row})")
+        # 헤더 행에서 대상 열 인덱스 수집 (alias 사전 사용)
+        col_idx = {
+            k: _find_col_idx(ws, header_row, COL_ALIASES[k])
+            for k in ("jijung", "jeungbil", "elapsed", "text", "amount", "currency", "ar_balance")
+        }
+        col_idx["mangil"] = _find_col_idx(ws, header_row, COL_ALIASES["mangil"]) if is_bal_sheet else None
+        logger.debug(f"  [{sheet_name}] header_row={header_row}, 열 인덱스: {col_idx}")
+
+        # 증빙일 컬럼 기준 마지막 데이터 행 찾기
+        anchor_idx = col_idx["jeungbil"]
+        if anchor_idx:
+            last_data_row = _find_last_data_row(ws, header_row, anchor_idx)
+        else:
+            last_data_row = ws.max_row
+        next_row = last_data_row + 1
+        logger.debug(f"  [{sheet_name}] 마지막 데이터 행: {last_data_row}, 삽입 시작행: {next_row}")
+
+        # 시트 최대 열 수 (서식 복사 범위용)
+        max_col = ws.max_column
+
+        # 행 기입 (위 셀 복사 대상: elapsed, ar_balance)
+        for row_offset, (_, row) in enumerate(data.iterrows()):
+            r = next_row + row_offset
+
+            # 서식 복사: 마지막 데이터 행 서식을 새 행에 적용
+            _copy_row_format(ws, last_data_row, r, max_col)
+
+            if col_idx["jijung"] and actual_jijung_col:
+                v = row.get(actual_jijung_col, "")
+                ws.cell(row=r, column=col_idx["jijung"]).value = None if pd.isna(v) else v
+
+            if col_idx["jeungbil"] and actual_budat_col:
+                ws.cell(row=r, column=col_idx["jeungbil"]).value = _parse_sap_date(row.get(actual_budat_col))
+
+            if col_idx["elapsed"]:
+                _copy_cell_above(ws, r, col_idx["elapsed"], r - 1)
+
+            if col_idx["text"] and actual_text_col:
+                v = row.get(actual_text_col, "")
+                ws.cell(row=r, column=col_idx["text"]).value = None if pd.isna(v) else v
+
+            if col_idx["amount"] and actual_amount_col:
+                ws.cell(row=r, column=col_idx["amount"]).value = _parse_amount(row.get(actual_amount_col))
+
+            if col_idx["currency"] and actual_currency_col:
+                v = row.get(actual_currency_col, "")
+                ws.cell(row=r, column=col_idx["currency"]).value = None if pd.isna(v) else v
+
+            if col_idx["ar_balance"]:
+                _copy_cell_above(ws, r, col_idx["ar_balance"], r - 1)
+
+            if col_idx["mangil"] and actual_net_due_col:
+                _mc = ws.cell(row=r, column=col_idx["mangil"])
+                if type(_mc).__name__ != "MergedCell":
+                    _mc.value = _parse_sap_date(row.get(actual_net_due_col))  # type: ignore[assignment]
+
+        added = len(data)
+        final_data_row = next_row + added - 1
+
+        # 수식 범위 확장: 금액·기상환액·상환 후 잔액 헤더 기준 1~2행 수식
+        for role in ("amount", "gigsanghwan", "ar_balance"):
+            fcol_idx = _find_col_idx(ws, header_row, COL_ALIASES[role])
+            if not fcol_idx:
+                continue
+            for foffset in formula_row_offsets:
+                frow = header_row + foffset
+                cell = ws.cell(row=frow, column=fcol_idx)
+                if isinstance(cell, openpyxl.cell.cell.MergedCell):
+                    continue
+                if cell.value and isinstance(cell.value, str) and cell.value.startswith("="):
+                    expanded = _expand_formula_range(cell.value, final_data_row)
+                    if expanded != cell.value:
+                        cell.value = expanded
+                        logger.debug(f"  [{sheet_name}] 수식 확장: {role} 행{frow} → {expanded}")
+
+        logger.info(f"  [{sheet_name}] {added}행 추가 완료 (시작행: {next_row})")
 
     wb.save(dest_file)
     logger.info(f"  저장 완료: {dest_file.name}")
+
+
+def append_offset_to_source_file(df_offset: pd.DataFrame, dest_file: Path, config, logger):
+    """
+    반제 데이터(offset df)를 채권명세서에 반영.
+
+    2-1) 지정 열 매칭 → 기상환액에 총계정원장금액 기입 (모든 시트)
+    2-2) 지정 열 매칭 → 상환일/반제전표 기입 (외화외상매출금/미수금 시트, 잔액 시트 제외)
+    2-3) 잔액 시트 → 증빙일 있고 금액 = 기상환액(상환 후 잔액 = 0)인 행 삭제
+    """
+    sap_jijung = config.get("APPEND", "col_jijung",       fallback="지정")
+    sap_amount = config.get("APPEND", "col_gl_amount",    fallback="총계정원장금액")
+    sap_augdt  = config.get("APPEND", "col_augdt",        fallback="반제일")
+    sap_augbl  = config.get("APPEND", "col_clearing_doc", fallback="반제전표")
+
+    hdr_default = config.getint("APPEND", "header_row_default", fallback=4)
+    hdr_ar_bal  = config.getint("APPEND", "header_row_ar_bal",  fallback=8)
+
+    sh_mis_bal = [s.strip() for s in config.get("APPEND", "sheet_misugeun_bal", fallback="미수금(잔액)").split("|")]
+    sh_mis     = [s.strip() for s in config.get("APPEND", "sheet_misugeun",     fallback="미수금").split("|")]
+    sh_ar_bal  = [s.strip() for s in config.get("APPEND", "sheet_ar_bal",       fallback="외화외상매출금(잔액)").split("|")]
+    sh_ar      = [s.strip() for s in config.get("APPEND", "sheet_ar",           fallback="외화외상매출금").split("|")]
+
+    actual_jijung = _find_df_col(df_offset, sap_jijung)
+    actual_amount = _find_df_col(df_offset, sap_amount)
+    actual_augdt  = _find_df_col(df_offset, sap_augdt)
+    actual_augbl  = _find_df_col(df_offset, sap_augbl)
+
+    if actual_jijung is None:
+        logger.warning(f"  [offset] 지정 컬럼 '{sap_jijung}' 없음 — offset append 건너뜀. 실제 컬럼: {list(df_offset.columns)}")
+        return
+
+    # 지정값 → 해당 offset 행 목록 조회용 딕셔너리
+    offset_lookup: dict[str, list] = {}
+    for _, row in df_offset.iterrows():
+        key = str(row[actual_jijung]).strip()
+        if key:
+            offset_lookup.setdefault(key, []).append(row)
+
+    if not offset_lookup:
+        logger.info("  [offset] 매칭 가능한 지정값 없음")
+        return
+
+    wb = openpyxl.load_workbook(dest_file)
+
+    def resolve_sheet(candidates: list[str]) -> str | None:
+        for name in candidates:
+            if name in wb.sheetnames:
+                return name
+        return None
+
+    # (후보시트, ar_bal여부, 잔액시트여부, 상환일·반제전표 기입여부)
+    for candidates, is_ar_bal_sheet, is_bal, write_extra in [
+        (sh_mis_bal, False, True,  False),
+        (sh_mis,     False, False, True),
+        (sh_ar_bal,  True,  True,  False),
+        (sh_ar,      False, False, True),
+    ]:
+        sheet_name = resolve_sheet(candidates)
+        if sheet_name is None:
+            logger.warning(f"  [offset] 시트 없음 (후보: {candidates}) — 건너뜀")
+            continue
+
+        ws = wb[sheet_name]
+        if is_ar_bal_sheet:
+            hdr = _find_header_row(ws, COL_ALIASES["anchor"]) or hdr_ar_bal
+        else:
+            hdr = hdr_default
+
+        jijung_idx      = _find_col_idx(ws, hdr, COL_ALIASES["jijung"])
+        jeungbil_idx    = _find_col_idx(ws, hdr, COL_ALIASES["jeungbil"])
+        amount_idx      = _find_col_idx(ws, hdr, COL_ALIASES["amount"])
+        gigsanghwan_idx = _find_col_idx(ws, hdr, COL_ALIASES["gigsanghwan"])
+        sanghwanil_idx  = _find_col_idx(ws, hdr, COL_ALIASES["sanghwanil"])   if write_extra else None
+        banjejeunpyo_idx= _find_col_idx(ws, hdr, COL_ALIASES["banjejeunpyo"]) if write_extra else None
+
+        if not jijung_idx:
+            logger.warning(f"  [offset] [{sheet_name}] 지정 열 없음 — 건너뜀")
+            continue
+
+        anchor_idx    = jeungbil_idx or jijung_idx
+        last_data_row = _find_last_data_row(ws, hdr, anchor_idx)
+
+        # 2-1, 2-2: 지정 매칭 → 값 기입
+        matched = 0
+        for data_row in range(hdr + 1, last_data_row + 1):
+            ws_jijung = ws.cell(row=data_row, column=jijung_idx).value
+            if ws_jijung is None:
+                continue
+            key = str(ws_jijung).strip()
+            if key not in offset_lookup:
+                continue
+
+            offset_rows = offset_lookup[key]
+
+            # 2-1) 기상환액 = 매칭된 offset 행들의 총계정원장금액 합계
+            if gigsanghwan_idx and actual_amount:
+                total = sum((_parse_amount(r.get(actual_amount)) or 0.0) for r in offset_rows)
+                ws.cell(row=data_row, column=gigsanghwan_idx).value = total  # type: ignore[assignment]
+
+            # 2-2) 상환일 / 반제전표 (잔액 시트 제외)
+            if write_extra:
+                first = offset_rows[0]
+                if sanghwanil_idx and actual_augdt:
+                    ws.cell(row=data_row, column=sanghwanil_idx).value = _parse_sap_date(first.get(actual_augdt))  # type: ignore[assignment]
+                if banjejeunpyo_idx and actual_augbl:
+                    v = first.get(actual_augbl, "")
+                    ws.cell(row=data_row, column=banjejeunpyo_idx).value = None if pd.isna(v) else v
+
+            matched += 1
+
+        logger.info(f"  [offset] [{sheet_name}] {matched}행 매칭 완료")
+
+        # 2-3) 잔액 시트: 증빙일 있고 금액 = 기상환액인 행 삭제
+        if is_bal and amount_idx and gigsanghwan_idx and jeungbil_idx:
+            last_row = _find_last_data_row(ws, hdr, anchor_idx)
+            rows_to_delete = []
+            for data_row in range(hdr + 1, last_row + 1):
+                if ws.cell(row=data_row, column=jeungbil_idx).value is None:
+                    continue
+                try:
+                    amt = ws.cell(row=data_row, column=amount_idx).value
+                    gig = ws.cell(row=data_row, column=gigsanghwan_idx).value
+                    amt_f = float(amt) if amt not in (None, "") else 0.0  # type: ignore[arg-type]
+                    gig_f = float(gig) if gig not in (None, "") else 0.0  # type: ignore[arg-type]
+                    if abs(amt_f - gig_f) < 0.01:
+                        rows_to_delete.append(data_row)
+                except (ValueError, TypeError):
+                    pass
+            for row_num in sorted(rows_to_delete, reverse=True):
+                ws.delete_rows(row_num)
+            if rows_to_delete:
+                logger.info(f"  [offset] [{sheet_name}] {len(rows_to_delete)}행 삭제 (상환 후 잔액 = 0)")
+
+    wb.save(dest_file)
+    logger.info(f"  [offset] 저장 완료: {dest_file.name}")
 
 
 def get_customer_accounts(source_dir: Path, logger) -> list[str]:
@@ -165,10 +577,14 @@ class FBL5NDownloader:
         self.all_items_radio    = config.get("SAP", "all_items_radio")
         self.budat_low_field    = config.get("SAP", "budat_low_field")
         self.budat_high_field   = config.get("SAP", "budat_high_field")
+        self.normal_items_chk   = config.get("SAP", "normal_items_chk")
         self.special_gl_chk     = config.get("SAP", "special_gl_chk")
         self.noted_items_chk    = config.get("SAP", "noted_items_chk")
         self.posting_date_col   = config.get("SAP", "posting_date_col", fallback="BUDAT")
         self.execute_vkey       = config.getint("SAP", "execute_vkey", fallback=8)
+
+        self.augdt_low_field  = config.get("SAP", "augdt_low_field",  fallback="wnd[0]/usr/ctxtSO_AUGDT-LOW")
+        self.augdt_high_field = config.get("SAP", "augdt_high_field", fallback="wnd[0]/usr/ctxtSO_AUGDT-HIGH")
 
         self.raw_dir    = Path(config.get("PATHS", "raw_dir"))
         self.source_dir = Path(config.get("PATHS", "source_dir"))
@@ -183,19 +599,30 @@ class FBL5NDownloader:
         self.logger.info("SAP GUI 세션 연결 완료")
 
     def run_all(self, accounts: list[str], budat_low: str, budat_high: str, yyyymm: str):
-        """모든 고객계정에 대해 FBL5N 실행 → 다운로드"""
+        """모든 고객계정에 대해 FBL5N 실행 → 미결항목 다운로드 → 반제항목 다운로드"""
         success, failed = [], []
 
         for i, account in enumerate(accounts, 1):
             self.logger.info(f"[{i}/{len(accounts)}] 계정: {account}  전기일: {budat_low} ~ {budat_high}")
+
+            # 1. 미결항목 (전기일 기간)
             try:
                 dest = self._run_single(account, budat_low, budat_high, yyyymm)
-                success.append(account)
                 self.logger.info(f"  → 저장 완료: {dest.name}")
             except Exception as e:
                 self.logger.error(f"  → 실패 ({account}): {e}")
                 failed.append(account)
                 self._go_back_to_start()
+                continue
+
+            # 2. 반제항목 (반제일 기간) — 결과 없어도 계정 전체 실패 처리 안 함
+            try:
+                self._run_single_offset(account, budat_low, budat_high, yyyymm)
+            except Exception as e:
+                self.logger.warning(f"  [offset] 건너뜀 ({account}): {e}")
+                self._go_back_to_start()
+
+            success.append(account)
 
         self.logger.info("=" * 50)
         self.logger.info(f"완료: 성공 {len(success)}건 / 실패 {len(failed)}건")
@@ -223,11 +650,66 @@ class FBL5NDownloader:
         source_file = find_source_file(self.source_dir, account)
         if source_file:
             self.logger.info(f"  원본 파일 발견: {source_file.name}")
-            append_to_source_file(df, source_file, self.config, self.logger)
+            append_to_source_file(df, source_file, self.config, self.logger, yyyymm)
         else:
             self.logger.warning(f"  원본 파일 없음 — append 건너뜀 (계정: {account})")
 
         return dest
+
+    def _run_single_offset(self, account: str, budat_low: str, budat_high: str, yyyymm: str) -> Path:
+        """반제일 기간 기준 FBL5N 조회 → _offset.xlsx 저장 → offset append"""
+        self._navigate_to_fbl5n()
+        self._fill_selection_screen_offset(account, budat_low, budat_high)
+        self.session.findById("wnd[0]").sendVKey(self.execute_vkey)
+        time.sleep(3)
+        self.logger.info("  [offset] FBL5N 조회 실행")
+
+        dest = self.raw_dir / f"{account}-{yyyymm}_offset.xlsx"
+        df_offset = self._read_grid_and_save(dest)
+
+        source_file = find_source_file(self.source_dir, account)
+        if source_file:
+            self.logger.info(f"  [offset] 원본 파일 발견: {source_file.name}")
+            append_offset_to_source_file(df_offset, source_file, self.config, self.logger)
+        else:
+            self.logger.warning(f"  [offset] 원본 파일 없음 — offset append 건너뜀 (계정: {account})")
+
+        return dest
+
+    def _fill_selection_screen_offset(self, account: str, budat_low: str, budat_high: str):
+        """FBL5N offset 선택 화면: 반제일 기간 입력, 전기일 비움"""
+        s = self.session
+        s.findById(self.customer_field).text = account
+        try:
+            s.findById(self.company_code_field).text = self.company_code
+        except Exception as e:
+            self.logger.warning(f"  [offset] 회사코드 입력 실패: {e}")
+        try:
+            s.findById(self.all_items_radio).select()
+        except Exception as e:
+            self.logger.warning(f"  [offset] 모든 항목 라디오 실패: {e}")
+        # 전기일 초기화 (SAP이 이전 값 기억할 수 있음)
+        try:
+            s.findById(self.budat_low_field).text  = ""
+            s.findById(self.budat_high_field).text = ""
+        except Exception:
+            pass
+        # 반제일 기간 입력
+        try:
+            s.findById(self.augdt_low_field).text  = budat_low
+            s.findById(self.augdt_high_field).text = budat_high
+        except Exception as e:
+            self.logger.warning(f"  [offset] 반제일 기간 입력 실패: {e}")
+        for chk, name in [
+            (self.normal_items_chk, "일반항목"),
+            (self.special_gl_chk,   "특별G/L"),
+            (self.noted_items_chk,  "임시항목"),
+        ]:
+            try:
+                s.findById(chk).selected = True
+            except Exception as e:
+                self.logger.warning(f"  [offset] {name} 체크 실패: {e}")
+        self.logger.info(f"  [offset] 선택 화면 완료 (계정: {account}, 반제일: {budat_low} ~ {budat_high})")
 
     def _navigate_to_fbl5n(self):
         """FBL5N 선택 화면으로 이동"""
@@ -258,6 +740,12 @@ class FBL5NDownloader:
         # 전기일 기간
         s.findById(self.budat_low_field).text  = budat_low
         s.findById(self.budat_high_field).text = budat_high
+
+        # 일반항목 체크
+        try:
+            s.findById(self.normal_items_chk).selected = True
+        except Exception as e:
+            self.logger.warning(f"  일반항목 체크 실패: {e}")
 
         # 특별G/L거래 체크
         try:
@@ -352,6 +840,11 @@ def parse_args():
         required=True,
         help="조회 기준 년월 (예: 202503). 해당 월 말일로 자동 변환됩니다.",
     )
+    parser.add_argument(
+        "--accounts",
+        nargs="+",
+        help="처리할 고객계정 목록 (미지정 시 source_dir 전체). 예: --accounts 1700006 1700051",
+    )
     return parser.parse_args()
 
 
@@ -374,12 +867,15 @@ def main():
         logger.error(f"source_dir 를 찾을 수 없습니다: {source_dir}")
         sys.exit(1)
 
-    accounts = get_customer_accounts(source_dir, logger)
-    if not accounts:
-        logger.error("고객계정을 추출할 파일이 없습니다.")
-        sys.exit(1)
-
-    logger.info(f"총 {len(accounts)}개 계정 추출: {accounts}")
+    if args.accounts:
+        accounts = args.accounts
+        logger.info(f"지정 계정 {len(accounts)}개: {accounts}")
+    else:
+        accounts = get_customer_accounts(source_dir, logger)
+        if not accounts:
+            logger.error("고객계정을 추출할 파일이 없습니다.")
+            sys.exit(1)
+        logger.info(f"총 {len(accounts)}개 계정 추출: {accounts}")
 
     # SAP 연결 및 실행
     downloader = FBL5NDownloader(config, logger)
