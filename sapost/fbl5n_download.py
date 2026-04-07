@@ -22,12 +22,38 @@ import argparse
 import calendar
 from copy import copy as _copy_obj
 from datetime import date
+from typing import Any
 from pathlib import Path
 
 import pandas as pd
 import openpyxl
+from openpyxl.utils import column_index_from_string, get_column_letter
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+
+def _load_account_corp_map() -> dict[str, str]:
+    """CLAUDE.md 의 법인코드 목록 테이블에서 고객코드 → 법인명 맵 생성."""
+    claude_md = Path(__file__).parent.parent / "CLAUDE.md"
+    result: dict[str, str] = {}
+    if not claude_md.exists():
+        return result
+    in_table = False
+    for line in claude_md.read_text(encoding="utf-8").splitlines():
+        # 헤더 행 감지
+        if "법인코드" in line and "법인명" in line and "고객코드" in line:
+            in_table = True
+            continue
+        if in_table:
+            if not line.strip().startswith("|"):
+                break
+            parts = [p.strip() for p in line.strip().strip("|").split("|")]
+            if len(parts) >= 3 and parts[2].isdigit():
+                result[parts[2]] = parts[1]
+    return result
+
+
+ACCOUNT_CORP_MAP: dict[str, str] = _load_account_corp_map()
 
 from sapost.src.utils import get_config, setup_logger
 
@@ -66,6 +92,20 @@ def find_source_file(source_dir: Path, account: str) -> Path | None:
         if f.is_file() and f.stem.startswith(account) and f.suffix in (".xlsx", ".xlsm"):
             return f
     return None
+
+
+def make_working_copy(source_file: Path, account: str, budat_high: str) -> Path:
+    """
+    원본 파일을 복사한 작업 복사본 경로 반환.
+    파일명: [고객코드] [법인명]법인채권명세서_[최종조회일자YYYYMMDD].xlsx
+    budat_high: 'YYYY.MM.DD' 형식
+    """
+    corp_name = ACCOUNT_CORP_MAP.get(account, account)
+    date_str  = budat_high.replace(".", "")   # '20260331'
+    new_name  = f"[{account}] {corp_name}법인채권명세서_{date_str}{source_file.suffix}"
+    dest      = source_file.parent / new_name
+    shutil.copy2(source_file, dest)
+    return dest
 
 
 def _parse_sap_date(val) -> date | None:
@@ -135,11 +175,14 @@ COL_ALIASES: dict[str, list[str]] = {
 
 
 def _find_col_idx(ws, header_row: int, col_name: "str | list[str]") -> int | None:
-    """헤더 행에서 col_name(단일 문자열 또는 alias 목록)과 일치하는 열 인덱스 반환."""
+    """헤더 행에서 col_name(단일 문자열 또는 alias 목록)과 일치하는 열 인덱스 반환.
+    ws[header_row] 대신 ws.cell() 직접 접근으로 max_column 전체 탐색."""
     aliases = col_name if isinstance(col_name, list) else [col_name]
-    for cell in ws[header_row]:
-        if cell.value and str(cell.value).strip() in aliases:
-            return cell.column
+    max_col = max(ws.max_column or 0, 30)
+    for c in range(1, max_col + 1):
+        val = ws.cell(row=header_row, column=c).value
+        if val and str(val).strip() in aliases:
+            return c
     return None
 
 
@@ -351,8 +394,7 @@ def append_to_source_file(df: pd.DataFrame, dest_file: Path, config, logger, yyy
             if col_idx["jeungbil"] and actual_budat_col:
                 ws.cell(row=r, column=col_idx["jeungbil"]).value = _parse_sap_date(row.get(actual_budat_col))
 
-            if col_idx["elapsed"]:
-                _copy_cell_above(ws, r, col_idx["elapsed"], r - 1)
+            # elapsed는 append/offset 완료 후 apply_elapsed_formulas에서 일괄 처리
 
             if col_idx["text"] and actual_text_col:
                 v = row.get(actual_text_col, "")
@@ -429,15 +471,26 @@ def append_offset_to_source_file(df_offset: pd.DataFrame, dest_file: Path, confi
         return
 
     # 지정값 → 해당 offset 행 목록 조회용 딕셔너리
+    # 키: 원본 문자열 AND 숫자 변환 값(앞 0 소멸) 동시 등록
     offset_lookup: dict[str, list] = {}
     for _, row in df_offset.iterrows():
-        key = str(row[actual_jijung]).strip()
-        if key:
-            offset_lookup.setdefault(key, []).append(row)
+        raw_key = str(row[actual_jijung]).strip()
+        if not raw_key:
+            continue
+        offset_lookup.setdefault(raw_key, []).append(row)
+        # 숫자로 해석 가능하면 int 변환 키도 등록 (앞 0 제거 대응)
+        try:
+            num_key = str(int(raw_key))
+            if num_key != raw_key:
+                offset_lookup.setdefault(num_key, []).append(row)
+        except ValueError:
+            pass
 
     if not offset_lookup:
         logger.info("  [offset] 매칭 가능한 지정값 없음")
         return
+
+    actual_budat_offset = _find_df_col(df_offset, config.get("APPEND", "col_budat", fallback="전기일"))
 
     wb = openpyxl.load_workbook(dest_file)
 
@@ -485,11 +538,29 @@ def append_offset_to_source_file(df_offset: pd.DataFrame, dest_file: Path, confi
             ws_jijung = ws.cell(row=data_row, column=jijung_idx).value
             if ws_jijung is None:
                 continue
-            key = str(ws_jijung).strip()
-            if key not in offset_lookup:
+
+            # 지정값: 원본 문자열 AND 숫자 변환(앞 0 제거) 둘 다 시도
+            raw_ws_key = str(ws_jijung).strip()
+            try:
+                num_ws_key = str(int(raw_ws_key))
+            except ValueError:
+                num_ws_key = raw_ws_key
+
+            offset_rows = offset_lookup.get(raw_ws_key) or offset_lookup.get(num_ws_key)
+            if not offset_rows:
                 continue
 
-            offset_rows = offset_lookup[key]
+            # 복수 행이면 증빙일 ↔ 전기일 2차 확인
+            if len(offset_rows) > 1 and jeungbil_idx and actual_budat_offset:
+                ws_jeungbil = ws.cell(row=data_row, column=jeungbil_idx).value
+                if ws_jeungbil is not None:
+                    ws_date = ws_jeungbil if isinstance(ws_jeungbil, date) else _parse_sap_date(str(ws_jeungbil))
+                    matched_rows = [
+                        r for r in offset_rows
+                        if _parse_sap_date(str(r.get(actual_budat_offset, ""))) == ws_date
+                    ]
+                    if matched_rows:
+                        offset_rows = matched_rows
 
             # 2-1) 기상환액 = 매칭된 offset 행들의 총계정원장금액 합계
             if gigsanghwan_idx and actual_amount:
@@ -534,6 +605,109 @@ def append_offset_to_source_file(df_offset: pd.DataFrame, dest_file: Path, confi
     logger.info(f"  [offset] 저장 완료: {dest_file.name}")
 
 
+def apply_elapsed_formulas(dest_file: Path, config, budat_high_date: date, logger):
+    """
+    경과기간 수식을 append·offset 완료 후 마지막에 일괄 기입.
+    - 기존 경과기간 수식에서 헤더 위쪽(고정 위치)을 참조하는 셀을 찾아
+      budat_high_date 를 기입 (수식 자체는 변경하지 않음)
+    - 새로 추가된 행에는 기존 수식 패턴을 행 오프셋만 조정해 복사
+    """
+    hdr_default = config.getint("APPEND", "header_row_default", fallback=4)
+    hdr_ar_bal  = config.getint("APPEND", "header_row_ar_bal",  fallback=8)
+
+    all_candidates = [
+        ([s.strip() for s in config.get("APPEND", "sheet_misugeun_bal", fallback="미수금(잔액)").split("|")],  False),
+        ([s.strip() for s in config.get("APPEND", "sheet_misugeun",     fallback="미수금").split("|")],        False),
+        ([s.strip() for s in config.get("APPEND", "sheet_ar_bal",       fallback="외화외상매출금(잔액)").split("|")], True),
+        ([s.strip() for s in config.get("APPEND", "sheet_ar",           fallback="외화외상매출금").split("|")], False),
+    ]
+
+    wb = openpyxl.load_workbook(dest_file)
+
+    def find_fixed_ref_cells(formula: str, data_start_row: int) -> list[tuple[str, int, int]]:
+        """
+        수식에서 데이터 영역 위쪽(row < data_start_row)을 참조하는 셀 주소 반환.
+        반환: [(원본참조문자열, 행번호, 열번호), ...]
+        """
+        results = []
+        for m in re.finditer(r'\$?([A-Z]+)\$?(\d+)', formula, re.IGNORECASE):
+            row_num = int(m.group(2))
+            if row_num < data_start_row:
+                try:
+                    col_num = column_index_from_string(m.group(1).upper())
+                    results.append((m.group(0), row_num, col_num))
+                except Exception:
+                    pass
+        return results
+
+    modified = False
+    for candidates, is_ar_bal in all_candidates:
+        sheet_name = next((n for n in candidates if n in wb.sheetnames), None)
+        if sheet_name is None:
+            continue
+
+        ws = wb[sheet_name]
+        hdr = (_find_header_row(ws, COL_ALIASES["anchor"]) or hdr_ar_bal) if is_ar_bal else hdr_default
+
+        elapsed_idx  = _find_col_idx(ws, hdr, COL_ALIASES["elapsed"])
+        jeungbil_idx = _find_col_idx(ws, hdr, COL_ALIASES["jeungbil"])
+        jijung_idx   = _find_col_idx(ws, hdr, COL_ALIASES["jijung"])
+        anchor_idx   = jeungbil_idx or jijung_idx
+        if not elapsed_idx or not anchor_idx:
+            continue
+
+        last_data_row = _find_last_data_row(ws, hdr, anchor_idx)
+        if last_data_row <= hdr:
+            continue
+
+        # 새로 추가된 행: 경과기간 비어 있고 anchor 값 있는 행
+        rows_to_fill = [
+            r for r in range(hdr + 1, last_data_row + 1)
+            if ws.cell(row=r, column=anchor_idx).value is not None
+            and ws.cell(row=r, column=elapsed_idx).value in (None, "")
+        ]
+        if not rows_to_fill:
+            continue
+
+        # 참조 수식: 빈 행 직전에서 위로 탐색
+        ref_formula: str | None = None
+        ref_row: int | None = None
+        for r in range(rows_to_fill[0] - 1, hdr, -1):
+            v = ws.cell(row=r, column=elapsed_idx).value
+            if isinstance(v, str) and v.startswith("="):
+                ref_formula = v
+                ref_row = r
+                break
+
+        if not ref_formula or ref_row is None:
+            logger.debug(f"  [{sheet_name}] 경과기간 참조 수식 없음 — 건너뜀")
+            continue
+
+        # 수식이 참조하는 고정 셀(헤더 위쪽)에 budat_high_date 기입
+        fixed_refs = find_fixed_ref_cells(ref_formula, hdr + 1)
+        date_cells_updated: list[str] = []
+        for _, row_num, col_num in fixed_refs:
+            _c = ws.cell(row=row_num, column=col_num)
+            if type(_c).__name__ != "MergedCell":
+                _c.value = budat_high_date  # type: ignore[assignment]
+                date_cells_updated.append(f"{get_column_letter(col_num)}{row_num}")
+        if date_cells_updated:
+            logger.info(f"  [{sheet_name}] 고정 참조 셀 {date_cells_updated} → {budat_high_date} 기입")
+
+        # 새 행에 수식 복사 (수식 자체는 그대로, 행 오프셋만 조정)
+        for r in rows_to_fill:
+            new_formula = _adjust_formula(ref_formula, r - ref_row)
+            _cell = ws.cell(row=r, column=elapsed_idx)
+            if type(_cell).__name__ != "MergedCell":
+                _cell.value = new_formula  # type: ignore[assignment]
+
+        logger.info(f"  [{sheet_name}] 경과기간 수식 {len(rows_to_fill)}행 기입")
+        modified = True
+
+    if modified:
+        wb.save(dest_file)
+
+
 def get_customer_accounts(source_dir: Path, logger) -> list[str]:
     """source_dir 의 파일명이 7자리 숫자로 시작하는 파일에서 고객계정 수집"""
     import re
@@ -564,7 +738,7 @@ class FBL5NDownloader:
     def __init__(self, config, logger):
         self.config = config
         self.logger = logger
-        self.session = None
+        self.session: "Any" = None
 
         env_path = Path(__file__).parent / "config" / ".env"
         load_dotenv(dotenv_path=env_path)
@@ -583,8 +757,9 @@ class FBL5NDownloader:
         self.posting_date_col   = config.get("SAP", "posting_date_col", fallback="BUDAT")
         self.execute_vkey       = config.getint("SAP", "execute_vkey", fallback=8)
 
-        self.augdt_low_field  = config.get("SAP", "augdt_low_field",  fallback="wnd[0]/usr/ctxtSO_AUGDT-LOW")
-        self.augdt_high_field = config.get("SAP", "augdt_high_field", fallback="wnd[0]/usr/ctxtSO_AUGDT-HIGH")
+        self.augdt_low_field      = config.get("SAP", "augdt_low_field",      fallback="wnd[0]/usr/ctxtSO_AUGDT-LOW")
+        self.augdt_high_field     = config.get("SAP", "augdt_high_field",     fallback="wnd[0]/usr/ctxtSO_AUGDT-HIGH")
+        self.cleared_items_radio  = config.get("SAP", "cleared_items_radio",  fallback="wnd[0]/usr/radX_CLSEL")
 
         self.raw_dir    = Path(config.get("PATHS", "raw_dir"))
         self.source_dir = Path(config.get("PATHS", "source_dir"))
@@ -605,9 +780,18 @@ class FBL5NDownloader:
         for i, account in enumerate(accounts, 1):
             self.logger.info(f"[{i}/{len(accounts)}] 계정: {account}  전기일: {budat_low} ~ {budat_high}")
 
+            # 원본 파일 확인 + 복사본 생성 (이후 모든 작업은 복사본에만)
+            source_file = find_source_file(self.source_dir, account)
+            if source_file:
+                working_copy = make_working_copy(source_file, account, budat_high)
+                self.logger.info(f"  복사본 생성: {working_copy.name}")
+            else:
+                working_copy = None
+                self.logger.warning(f"  원본 파일 없음 — append 건너뜀 (계정: {account})")
+
             # 1. 미결항목 (전기일 기간)
             try:
-                dest = self._run_single(account, budat_low, budat_high, yyyymm)
+                dest = self._run_single(account, budat_low, budat_high, yyyymm, working_copy)
                 self.logger.info(f"  → 저장 완료: {dest.name}")
             except Exception as e:
                 self.logger.error(f"  → 실패 ({account}): {e}")
@@ -615,9 +799,9 @@ class FBL5NDownloader:
                 self._go_back_to_start()
                 continue
 
-            # 2. 반제항목 (반제일 기간) — 결과 없어도 계정 전체 실패 처리 안 함
+            # 2. 반제항목 (반제일 기간) — 실패해도 계정 전체 실패 처리 안 함
             try:
-                self._run_single_offset(account, budat_low, budat_high, yyyymm)
+                self._run_single_offset(account, budat_low, budat_high, yyyymm, working_copy)
             except Exception as e:
                 self.logger.warning(f"  [offset] 건너뜀 ({account}): {e}")
                 self._go_back_to_start()
@@ -629,34 +813,24 @@ class FBL5NDownloader:
         if failed:
             self.logger.warning(f"실패 계정: {failed}")
 
-    def _run_single(self, account: str, budat_low: str, budat_high: str, yyyymm: str) -> Path:
+    def _run_single(self, account: str, budat_low: str, budat_high: str, yyyymm: str,
+                    working_copy: "Path | None") -> Path:
         """단일 고객계정 FBL5N 실행 → 저장 → 파일 경로 반환"""
-        # 1) FBL5N 트랜잭션 이동
         self._navigate_to_fbl5n()
-
-        # 2) 선택 화면 입력
         self._fill_selection_screen(account, budat_low, budat_high)
-
-        # 3) 실행 (F8)
         self.session.findById("wnd[0]").sendVKey(self.execute_vkey)
         time.sleep(3)
         self.logger.info("  FBL5N 조회 실행")
 
-        # 4) ALV 그리드에서 직접 읽기 → pandas 정렬 → 엑셀 저장
         dest = self.raw_dir / f"{account}-{yyyymm}.xlsx"
         df = self._read_grid_and_save(dest)
 
-        # 5) source_dir 의 원본 파일에 append
-        source_file = find_source_file(self.source_dir, account)
-        if source_file:
-            self.logger.info(f"  원본 파일 발견: {source_file.name}")
-            append_to_source_file(df, source_file, self.config, self.logger, yyyymm)
-        else:
-            self.logger.warning(f"  원본 파일 없음 — append 건너뜀 (계정: {account})")
-
+        if working_copy:
+            append_to_source_file(df, working_copy, self.config, self.logger, yyyymm)
         return dest
 
-    def _run_single_offset(self, account: str, budat_low: str, budat_high: str, yyyymm: str) -> Path:
+    def _run_single_offset(self, account: str, budat_low: str, budat_high: str, yyyymm: str,
+                           working_copy: "Path | None") -> Path:
         """반제일 기간 기준 FBL5N 조회 → _offset.xlsx 저장 → offset append"""
         self._navigate_to_fbl5n()
         self._fill_selection_screen_offset(account, budat_low, budat_high)
@@ -667,12 +841,13 @@ class FBL5NDownloader:
         dest = self.raw_dir / f"{account}-{yyyymm}_offset.xlsx"
         df_offset = self._read_grid_and_save(dest)
 
-        source_file = find_source_file(self.source_dir, account)
-        if source_file:
-            self.logger.info(f"  [offset] 원본 파일 발견: {source_file.name}")
-            append_offset_to_source_file(df_offset, source_file, self.config, self.logger)
+        if working_copy:
+            append_offset_to_source_file(df_offset, working_copy, self.config, self.logger)
+            # 경과기간 수식: append + offset 완료 후 마지막에 일괄 기입
+            budat_high_date = _parse_sap_date(budat_high) or date.today()
+            apply_elapsed_formulas(working_copy, self.config, budat_high_date, self.logger)
         else:
-            self.logger.warning(f"  [offset] 원본 파일 없음 — offset append 건너뜀 (계정: {account})")
+            self.logger.warning(f"  [offset] 복사본 없음 — offset append 건너뜀 (계정: {account})")
 
         return dest
 
@@ -684,10 +859,11 @@ class FBL5NDownloader:
             s.findById(self.company_code_field).text = self.company_code
         except Exception as e:
             self.logger.warning(f"  [offset] 회사코드 입력 실패: {e}")
+        # 반제항목 라디오 선택 (반제일 필터가 올바르게 동작하려면 반드시 반제항목 모드여야 함)
         try:
-            s.findById(self.all_items_radio).select()
+            s.findById(self.cleared_items_radio).select()
         except Exception as e:
-            self.logger.warning(f"  [offset] 모든 항목 라디오 실패: {e}")
+            self.logger.warning(f"  [offset] 반제항목 라디오 실패: {e}")
         # 전기일 초기화 (SAP이 이전 값 기억할 수 있음)
         try:
             s.findById(self.budat_low_field).text  = ""
@@ -837,8 +1013,16 @@ def parse_args():
     parser = argparse.ArgumentParser(description="FBL5N 채권 미결항목 다운로드")
     parser.add_argument(
         "--keydate",
-        required=True,
-        help="조회 기준 년월 (예: 202503). 해당 월 말일로 자동 변환됩니다.",
+        required=False,
+        help="조회 기준 년월 (예: 202503). 해당 월 말일로 자동 변환됩니다. --budat_low/high 와 동시 사용 불가.",
+    )
+    parser.add_argument(
+        "--budat_low",
+        help="전기일 시작 (YYYYMMDD). 예: 20260101",
+    )
+    parser.add_argument(
+        "--budat_high",
+        help="전기일 종료 (YYYYMMDD). 예: 20260331",
     )
     parser.add_argument(
         "--accounts",
@@ -848,11 +1032,33 @@ def parse_args():
     return parser.parse_args()
 
 
+def _parse_date_arg(s: str) -> str:
+    """'20260101' → '2026.01.01' (SAP 날짜 형식)"""
+    s = s.strip()
+    if len(s) == 8 and s.isdigit():
+        return f"{s[:4]}.{s[4:6]}.{s[6:]}"
+    raise ValueError(f"날짜 형식 오류: {s!r}  (YYYYMMDD 형식으로 입력)")
+
+
 def main():
     args = parse_args()
-    yyyymm    = args.keydate
-    budat_low  = month_start(yyyymm)
-    budat_high = month_end(yyyymm)
+
+    if args.keydate and (args.budat_low or args.budat_high):
+        print("ERROR: --keydate 와 --budat_low/--budat_high 는 동시에 사용할 수 없습니다.")
+        sys.exit(1)
+    if not args.keydate and not (args.budat_low and args.budat_high):
+        print("ERROR: --keydate 또는 --budat_low + --budat_high 중 하나를 지정하세요.")
+        sys.exit(1)
+
+    if args.keydate:
+        yyyymm     = args.keydate
+        budat_low  = month_start(yyyymm)
+        budat_high = month_end(yyyymm)
+    else:
+        budat_low  = _parse_date_arg(args.budat_low)
+        budat_high = _parse_date_arg(args.budat_high)
+        # yyyymm: raw 파일명 접미사로 사용 — 종료월 기준
+        yyyymm = args.budat_high.strip()[:6]
 
     config = get_config()
     logger = setup_logger("sapost.fbl5n", config)
