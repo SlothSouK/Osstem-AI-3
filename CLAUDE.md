@@ -114,26 +114,32 @@ python sapost/fbl5n_download.py --budat_low 20260101 --budat_high 20260331
 
 # 특정 계정만 재실행
 python sapost/fbl5n_download.py --budat_low 20260101 --budat_high 20260331 --accounts 1700006 1700029
+
+# 경로 직접 지정 (config.ini 수정 없이 조건문 경로 override)
+python sapost/fbl5n_download.py --budat_low 20260101 --budat_high 20260331 --source_dir "D:\경로\채권명세서"
 ```
 
 동작:
-- `source_dir` (config.ini) 의 파일명 앞 7자리 숫자 = 고객계정
+- `--source_dir` 지정 시 config.ini 수정 없이 해당 경로 사용, raw_dir은 하위 `raw/` 자동 설정
+- 파일명 앞 7자리 숫자 = 고객계정 (source_dir 내 파일 자동 탐지)
 - 원본 파일은 수정하지 않고 **복사본** 생성 후 작업 (`[고객코드] [법인명]법인채권명세서_YYYYMMDD.xlsx`)
 - **미결항목**: FBL5N → 회사코드 1000, 모든 항목, 전기일 기간 조회 → `raw/{계정}-{YYYYMM}.xlsx`
 - **반제항목**: 반제일 기간으로 재조회(반제항목 모드) → `raw/{계정}-{YYYYMM}_offset.xlsx`
 - SG=M → 미수금(잔액)/미수금 시트 append / 그 외 → 외화외상매출금(잔액)/외화외상매출금 시트 append
-- offset 매칭: 지정값 문자열 일치 OR 숫자 변환(앞 0 제거) 일치, 복수 행 시 증빙일↔전기일 2차 확인
-- offset 반영: 기상환액 기입, 상환일·반제전표 기입, 잔액=0 행 자동 삭제
-- 경과기간 수식: append·offset 완료 후 마지막에 일괄 기입, 고정 참조 셀에 조회 종료일 기입
+- offset 매칭: **지정값 + 증빙일 둘 다 일치**해야 반제로 인식 (지정값은 앞 0 제거 변환도 병행)
+- 부분 수금: 잔액 시트 금액 차감 + 경고 알림 / 총액 시트 기상환액 기입 / 완전 수금은 행 삭제
+- offset 반영: 기상환액 기입, 상환일·반제전표 기입 (총액 시트만)
+- 경과기간 수식: append·offset 완료 후 마지막에 일괄 기입, D6 셀에 조회 종료일 기입
 - 헤더 행 자동 탐지 + 한국어·영어·스페인어 컬럼명 alias 매핑 (법인별 양식 차이 대응)
 - 법인명은 CLAUDE.md 법인코드 목록에서 동적으로 읽어옴
+- 만기일: raw 파일 '순 만기일' 컬럼 → 잔액 시트 만기일 헤더 자동 기입 (공백 포함 컬럼명 대응)
 
-채권명세서 파일 위치: `source_dir` (config.ini [PATHS]) — 파일명 앞 7자리 = 고객코드
+채권명세서 파일 위치: `--source_dir` 인수 또는 config.ini `[PATHS] source_dir` — 파일명 앞 7자리 = 고객코드
 
 실행 전 필수 설정:
 - `sapost/config/.env` — SAP_USER_ID, SAP_PASSWORD, SAP_CLIENT=100
 - SAP GUI 실행 중 + 스크립팅 활성화 필요 (Alt+F12 → Options → Scripting)
-- `sapost/config/config.ini` — `source_dir`, `raw_dir` 경로 확인
+- `sapost/config/config.ini` — `source_dir`, `raw_dir` 경로 확인 (--source_dir 인수로 override 가능)
 
 ---
 

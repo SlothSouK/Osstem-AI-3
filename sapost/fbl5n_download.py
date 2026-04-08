@@ -21,7 +21,7 @@ import shutil
 import argparse
 import calendar
 from copy import copy as _copy_obj
-from datetime import date
+from datetime import date, datetime
 from typing import Any
 from pathlib import Path
 
@@ -164,9 +164,14 @@ def _adjust_formula(formula: str, row_offset: int) -> str:
 
 
 def _find_df_col(df: pd.DataFrame, keyword: str) -> str | None:
-    """DataFrame 컬럼명 중 keyword로 시작하는 첫 번째 컬럼명 반환. 없으면 None."""
+    """DataFrame 컬럼명 중 keyword로 시작하는 첫 번째 컬럼명 반환. 없으면 None.
+    공백 정규화(strip spaces) 비교도 병행해 'col_net_due_date = 순만기일' ↔ '순 만기일' 불일치 대응."""
+    norm_kw = keyword.replace(" ", "")
     for col in df.columns:
-        if str(col).startswith(keyword):
+        col_s = str(col)
+        if col_s.startswith(keyword):
+            return col
+        if col_s.replace(" ", "").startswith(norm_kw):
             return col
     return None
 
@@ -534,6 +539,24 @@ def append_offset_to_source_file(df_offset: pd.DataFrame, dest_file: Path, confi
             logger.warning(f"  [offset] [{sheet_name}] 지정 열 없음 — 건너뜀")
             continue
 
+        # 컬럼 탐색 결과 INFO 로그 (진단용)
+        logger.info(
+            f"  [offset] [{sheet_name}] header={hdr} | "
+            f"지정={jijung_idx} 증빙일={jeungbil_idx} 금액={amount_idx} "
+            f"기상환액={gigsanghwan_idx} 상환일={sanghwanil_idx} 반제전표={banjejeunpyo_idx}"
+        )
+        if not gigsanghwan_idx:
+            # 헤더 행 실제 값 출력 (alias 불일치 진단용)
+            actual_headers = [
+                ws.cell(row=hdr, column=c).value
+                for c in range(1, min((ws.max_column or 0) + 1, 40))
+                if ws.cell(row=hdr, column=c).value is not None
+            ]
+            logger.warning(
+                f"  [offset] [{sheet_name}] ⚠️ 기상환액 열 못 찾음 → 기상환액 기입 건너뜀. "
+                f"실제 헤더: {actual_headers}"
+            )
+
         anchor_idx    = jeungbil_idx or jijung_idx
         last_data_row = _find_last_data_row(ws, hdr, anchor_idx)
 
@@ -555,17 +578,24 @@ def append_offset_to_source_file(df_offset: pd.DataFrame, dest_file: Path, confi
             if not offset_rows:
                 continue
 
-            # 복수 행이면 증빙일 ↔ 전기일 2차 확인
-            if len(offset_rows) > 1 and jeungbil_idx and actual_budat_offset:
+            # 무조건 증빙일 일치 확인 (지정값 + 증빙일 둘 다 일치해야 반제로 인식)
+            # openpyxl은 날짜 셀을 datetime으로 반환하므로 date로 정규화 후 비교
+            if jeungbil_idx and actual_budat_offset:
                 ws_jeungbil = ws.cell(row=data_row, column=jeungbil_idx).value
                 if ws_jeungbil is not None:
-                    ws_date = ws_jeungbil if isinstance(ws_jeungbil, date) else _parse_sap_date(str(ws_jeungbil))
+                    if isinstance(ws_jeungbil, datetime):
+                        ws_date = ws_jeungbil.date()
+                    elif isinstance(ws_jeungbil, date):
+                        ws_date = ws_jeungbil
+                    else:
+                        ws_date = _parse_sap_date(str(ws_jeungbil))
                     matched_rows = [
                         r for r in offset_rows
                         if _parse_sap_date(str(r.get(actual_budat_offset, ""))) == ws_date
                     ]
-                    if matched_rows:
-                        offset_rows = matched_rows
+                    if not matched_rows:
+                        continue  # 지정값 일치해도 증빙일 불일치 → 반제 아님
+                    offset_rows = matched_rows
 
             # 2-1) 기상환액 = 매칭된 offset 행들의 총계정원장금액 합계
             if gigsanghwan_idx and actual_amount:
@@ -585,10 +615,11 @@ def append_offset_to_source_file(df_offset: pd.DataFrame, dest_file: Path, confi
 
         logger.info(f"  [offset] [{sheet_name}] {matched}행 매칭 완료")
 
-        # 2-3) 잔액 시트: 증빙일 있고 금액 = 기상환액인 행 삭제
+        # 2-3) 잔액 시트: 완전 수금 행 삭제 / 부분 수금 행 금액 차감
         if is_bal and amount_idx and gigsanghwan_idx and jeungbil_idx:
             last_row = _find_last_data_row(ws, hdr, anchor_idx)
             rows_to_delete = []
+            partial_count = 0
             for data_row in range(hdr + 1, last_row + 1):
                 if ws.cell(row=data_row, column=jeungbil_idx).value is None:
                     continue
@@ -598,13 +629,25 @@ def append_offset_to_source_file(df_offset: pd.DataFrame, dest_file: Path, confi
                     amt_f = float(amt) if amt not in (None, "") else 0.0  # type: ignore[arg-type]
                     gig_f = float(gig) if gig not in (None, "") else 0.0  # type: ignore[arg-type]
                     if abs(amt_f - gig_f) < 0.01:
+                        # 완전 수금 → 행 삭제
                         rows_to_delete.append(data_row)
+                    elif gig_f > 0:
+                        # 부분 수금: 금액 -= 부분수금액, 기상환액 = 0 (상환후잔액 수식 정합성 유지)
+                        partial_count += 1
+                        logger.warning(
+                            f"  [부분수금] [{sheet_name}] {data_row}행: "
+                            f"원금={amt_f:,.2f}, 수금액={gig_f:,.2f}, 잔액={amt_f - gig_f:,.2f}"
+                        )
+                        ws.cell(row=data_row, column=amount_idx).value = amt_f - gig_f  # type: ignore[assignment]
+                        ws.cell(row=data_row, column=gigsanghwan_idx).value = 0          # type: ignore[assignment]
                 except (ValueError, TypeError):
                     pass
             for row_num in sorted(rows_to_delete, reverse=True):
                 ws.delete_rows(row_num)
             if rows_to_delete:
                 logger.info(f"  [offset] [{sheet_name}] {len(rows_to_delete)}행 삭제 (상환 후 잔액 = 0)")
+            if partial_count:
+                logger.warning(f"  ⚠️  [부분수금] [{sheet_name}] {partial_count}건 발생 — 금액 차감 처리 완료")
 
     wb.save(dest_file)
     logger.info(f"  [offset] 저장 완료: {dest_file.name}")
@@ -1015,6 +1058,10 @@ def parse_args():
         nargs="+",
         help="처리할 고객계정 목록 (미지정 시 source_dir 전체). 예: --accounts 1700006 1700051",
     )
+    parser.add_argument(
+        "--source_dir",
+        help="채권명세서 파일 경로 (지정 시 config.ini source_dir 덮어씀, raw_dir은 하위 raw/ 로 자동 설정)",
+    )
     return parser.parse_args()
 
 
@@ -1048,6 +1095,13 @@ def main():
 
     config = get_config()
     logger = setup_logger("sapost.fbl5n", config)
+
+    # --source_dir 지정 시 config 메모리 내 덮어쓰기 (config.ini 파일 수정 없음)
+    if args.source_dir:
+        src = Path(args.source_dir)
+        config.set("PATHS", "source_dir", str(src))
+        config.set("PATHS", "raw_dir",    str(src / "raw"))
+        logger.info(f"source_dir override: {src}")
 
     logger.info("=" * 60)
     logger.info(f"FBL5N 다운로드 시작 | 전기일: {budat_low} ~ {budat_high}")
