@@ -2,12 +2,13 @@
 
 ## 프로젝트 개요
 
-네 가지 독립적인 모듈로 구성된 프로젝트:
+다섯 가지 독립적인 모듈로 구성된 프로젝트:
 
 1. **챗봇 웹앱** (`backend/` + `frontend/`) — Claude API 기반 풀스택 채팅 앱
 2. **충당금 자동화** (`automation/`) — 해외관리2팀 ERP 업무 자동화 스크립트
 3. **웹 스크래퍼** (`ostconfin/`) — confinas.osstem.com 데이터 수집 → 엑셀 저장
 4. **SAP 채권 자동화** (`sapost/`) — FBL5N 미결항목 ALV 직독 → 엑셀 저장
+5. **영업수금 집계** (`collection/`) — 자금일보 엑셀에서 Category=Collection 합산 → 검증 파일 생성
 
 ---
 
@@ -55,6 +56,13 @@ Osstem-AI-3/
 │   │   ├── data_processor.py   데이터 정제 (pandas)
 │   │   ├── template_writer.py  엑셀 양식 기입 (openpyxl)
 │   │   └── utils.py            로거, retry 데코레이터
+│   └── requirements.txt
+├── collection/           영업수금 집계 (openpyxl)
+│   ├── main.py           실행 진입점 (python collection/main.py)
+│   ├── config/
+│   │   └── config.ini    자금일보 경로, 집계 대상 Category 설정
+│   ├── src/
+│   │   └── collector.py  시트 탐색·집계·검증 파일 생성
 │   └── requirements.txt
 └── CLAUDE.md
 ```
@@ -140,6 +148,34 @@ python sapost/fbl5n_download.py --budat_low 20260101 --budat_high 20260331 --sou
 - `sapost/config/.env` — SAP_USER_ID, SAP_PASSWORD, SAP_CLIENT=100
 - SAP GUI 실행 중 + 스크립팅 활성화 필요 (Alt+F12 → Options → Scripting)
 - `sapost/config/config.ini` — `source_dir`, `raw_dir` 경로 확인 (--source_dir 인수로 override 가능)
+
+---
+
+## 영업수금 집계 실행 (collection)
+
+자금일보 엑셀 파일에서 inflow 테이블의 Category = Collection 행을 합산해 영업수금을 산출한다.
+
+```bash
+# 의존성 설치
+pip install -r collection/requirements.txt
+
+# 기본 실행 (config.ini source_file 사용)
+python collection/main.py
+
+# 파일 직접 지정
+python collection/main.py --file "D:\경로\자금일보.xlsx"
+
+# 출력 파일 경로 지정
+python collection/main.py --file "D:\경로\자금일보.xlsx" --output "D:\결과\영업수금.xlsx"
+```
+
+동작:
+- 날짜 형식 시트(DD.MM.YYYY) 전체 탐색
+- 각 시트에서 inflow 테이블 헤더 행 자동 탐지 (Category 컬럼 위치 기준)
+- Category = Collection (대소문자 무시) 행 Amount 합산 → 영업수금
+- 검증용 엑셀 파일 생성 (시트별 소계 + 전체 합계)
+
+설정: `collection/config/config.ini` — source_file 경로, target_category, sheet_pattern
 
 ---
 
