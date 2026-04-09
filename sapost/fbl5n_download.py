@@ -603,13 +603,22 @@ def append_offset_to_source_file(df_offset: pd.DataFrame, dest_file: Path, confi
                 ws.cell(row=data_row, column=gigsanghwan_idx).value = total  # type: ignore[assignment]
 
             # 2-2) 상환일 / 반제전표 (잔액 시트 제외)
-            if write_extra:
+            # 반제전표 헤더가 없어도 상환일 옆 셀(+1)에 반제전표번호 기입
+            # 이미 값이 있으면 +2씩 우측으로 이동하여 빈 셀 쌍 탐색
+            if write_extra and sanghwanil_idx and actual_augdt:
                 first = offset_rows[0]
-                if sanghwanil_idx and actual_augdt:
-                    ws.cell(row=data_row, column=sanghwanil_idx).value = _parse_sap_date(first.get(actual_augdt))  # type: ignore[assignment]
-                if banjejeunpyo_idx and actual_augbl:
+                sanghwanil_val = _parse_sap_date(first.get(actual_augdt))
+                banjejeunpyo_val = None
+                if actual_augbl:
                     v = first.get(actual_augbl, "")
-                    ws.cell(row=data_row, column=banjejeunpyo_idx).value = None if pd.isna(v) else v
+                    banjejeunpyo_val = None if pd.isna(v) else v
+
+                write_col = sanghwanil_idx
+                while ws.cell(row=data_row, column=write_col).value is not None:
+                    write_col += 2
+
+                ws.cell(row=data_row, column=write_col).value = sanghwanil_val  # type: ignore[assignment]
+                ws.cell(row=data_row, column=write_col + 1).value = banjejeunpyo_val  # type: ignore[assignment]
 
             matched += 1
 
@@ -1073,32 +1082,177 @@ def _parse_date_arg(s: str) -> str:
     raise ValueError(f"날짜 형식 오류: {s!r}  (YYYYMMDD 형식으로 입력)")
 
 
+# 법인명 → 고객코드 역방향 맵 (부분 일치 검색용)
+_CORP_NAME_MAP: dict[str, str] = {v: k for k, v in ACCOUNT_CORP_MAP.items()}
+
+
+def _resolve_accounts_from_input(raw: str) -> list[str] | None:
+    """
+    입력 문자열 → 고객계정 목록 반환.
+    - 빈 입력 → None (source_dir 전체 사용)
+    - '일체' 단독 → None (경로 내 전체, 엔터와 동일)
+    - '해외법인 일체' → ACCOUNT_CORP_MAP 전체 고객코드
+    - 'X 일체' → X 부분 일치 법인 전체 (예: '유럽 일체' → 유럽법인)
+    - 7자리 숫자 → 그대로 사용
+    - 법인명 포함 문자열 → ACCOUNT_CORP_MAP에서 부분 일치 검색
+    - 여러 개는 쉼표 또는 공백으로 구분
+    """
+    raw = raw.strip()
+    if not raw:
+        return None
+
+    # '일체' 키워드: 선행 조건에 해당하는 전부
+    if "일체" in raw:
+        prefix = raw.replace("일체", "").strip()
+        if not prefix:
+            # '일체' 단독 → 경로 내 전체 (None과 동일)
+            return None
+        if prefix == "해외법인":
+            # 해외법인 일체 → ACCOUNT_CORP_MAP 전체
+            all_codes = list(ACCOUNT_CORP_MAP.keys())
+            print(f"  → 해외법인 전체 {len(all_codes)}개 법인")
+            return all_codes
+        # 'X 일체' → X 부분 일치 법인 전체
+        matched = sorted({code for name, code in _CORP_NAME_MAP.items() if prefix in name})
+        if matched:
+            names = [ACCOUNT_CORP_MAP.get(c, c) for c in matched]
+            print(f"  → '{prefix}' 일치 {len(matched)}개: {names}")
+            return matched
+        print(f"  ⚠️  '{prefix}' — 일치하는 법인 없음. 해외법인 전체로 처리합니다.")
+        return list(ACCOUNT_CORP_MAP.keys())
+
+    accounts: list[str] = []
+    tokens = [t.strip() for t in re.split(r"[,\s]+", raw) if t.strip()]
+    for token in tokens:
+        # 7자리 숫자 → 고객코드 직접 입력
+        if re.match(r"^\d{7}$", token):
+            accounts.append(token)
+            continue
+        # 법인명 부분 일치 (예: "유럽" → "유럽법인" → 1700031)
+        matched = [code for name, code in _CORP_NAME_MAP.items() if token in name]
+        if matched:
+            accounts.extend(matched)
+        else:
+            print(f"  ⚠️  '{token}' — 일치하는 법인 없음. 건너뜀.")
+    return accounts if accounts else None
+
+
+def interactive_prompt() -> dict:
+    """
+    인수 없이 실행 시 CMD/터미널에서 조건을 입력받는 인터랙티브 모드.
+    확인 단계에서 Y=실행 / R=처음부터 다시 / N=취소 선택 가능.
+    반환: {budat_low, budat_high, yyyymm, accounts, source_dir}
+    """
+    sep = "=" * 55
+
+    while True:
+        print(sep)
+        print("  채권명세서 업데이트 — 조건 입력")
+        print(sep)
+
+        # ── 법인 ──
+        print("\n[법인]")
+        print("  고객코드(7자리), 법인명(부분 일치), 또는 여러 개를 쉼표로 구분")
+        print("  '일체' 키워드: 선행 조건의 전체 법인 자동 선택")
+        print("  예) 유럽  /  1700031  /  독일, 프랑스  /  (엔터 또는 일체) → 경로 내 전체")
+        print("      해외법인 일체 → CLAUDE.md 전체 법인  /  유럽 일체 → 유럽 포함 법인 전체")
+        corp_input = input("  입력: ").strip()
+        accounts = _resolve_accounts_from_input(corp_input)
+        if accounts:
+            names = [ACCOUNT_CORP_MAP.get(a, a) for a in accounts]
+            print(f"  → {list(zip(accounts, names))}")
+        else:
+            print("  → 경로 내 전체 법인")
+
+        # ── 기간 ──
+        print("\n[기간]  형식: YYYYMMDD")
+        while True:
+            try:
+                low_raw  = input("  시작일 (예: 20260301): ").strip()
+                high_raw = input("  종료일 (예: 20260331): ").strip()
+                budat_low  = _parse_date_arg(low_raw)
+                budat_high = _parse_date_arg(high_raw)
+                yyyymm = high_raw[:6]
+                print(f"  → {budat_low} ~ {budat_high}")
+                break
+            except ValueError as e:
+                print(f"  ❌ {e}  다시 입력해주세요.")
+
+        # ── 경로 ──
+        print("\n[경로]  채권명세서 파일 폴더 경로")
+        print("  (엔터) → config.ini 기본 경로 사용")
+        source_dir_input = input("  입력: ").strip()
+        if source_dir_input:
+            print(f"  → {source_dir_input}")
+        else:
+            print("  → config.ini 기본 경로 사용")
+
+        # ── 확인 ──
+        print(f"\n{sep}")
+        print("  실행 조건 확인")
+        print(f"  법인  : {', '.join(ACCOUNT_CORP_MAP.get(a, a) for a in accounts) if accounts else '전체'}")
+        print(f"  기간  : {budat_low} ~ {budat_high}")
+        print(f"  경로  : {source_dir_input if source_dir_input else '(config.ini 기본값)'}")
+        print(sep)
+        confirm = input("  Y/엔터=실행   R=처음부터 다시   N=취소  →  ").strip().lower()
+
+        if confirm in ("", "y"):
+            break                      # 실행
+        elif confirm == "r":
+            print("\n" + "─" * 55)
+            print("  조건을 처음부터 다시 입력합니다.")
+            print("─" * 55 + "\n")
+            continue                   # while True 처음으로
+        else:
+            print("취소되었습니다.")
+            sys.exit(0)
+
+    return {
+        "budat_low":   budat_low,
+        "budat_high":  budat_high,
+        "yyyymm":      yyyymm,
+        "accounts":    accounts,
+        "source_dir":  source_dir_input or None,
+    }
+
+
 def main():
-    args = parse_args()
-
-    if args.keydate and (args.budat_low or args.budat_high):
-        print("ERROR: --keydate 와 --budat_low/--budat_high 는 동시에 사용할 수 없습니다.")
-        sys.exit(1)
-    if not args.keydate and not (args.budat_low and args.budat_high):
-        print("ERROR: --keydate 또는 --budat_low + --budat_high 중 하나를 지정하세요.")
-        sys.exit(1)
-
-    if args.keydate:
-        yyyymm     = args.keydate
-        budat_low  = month_start(yyyymm)
-        budat_high = month_end(yyyymm)
+    # 인수 없이 실행 시 인터랙티브 모드
+    if len(sys.argv) == 1:
+        params     = interactive_prompt()
+        budat_low  = params["budat_low"]
+        budat_high = params["budat_high"]
+        yyyymm     = params["yyyymm"]
+        accounts_input  = params["accounts"]
+        source_dir_input = params["source_dir"]
     else:
-        budat_low  = _parse_date_arg(args.budat_low)
-        budat_high = _parse_date_arg(args.budat_high)
-        # yyyymm: raw 파일명 접미사로 사용 — 종료월 기준
-        yyyymm = args.budat_high.strip()[:6]
+        args = parse_args()
+
+        if args.keydate and (args.budat_low or args.budat_high):
+            print("ERROR: --keydate 와 --budat_low/--budat_high 는 동시에 사용할 수 없습니다.")
+            sys.exit(1)
+        if not args.keydate and not (args.budat_low and args.budat_high):
+            print("ERROR: --keydate 또는 --budat_low + --budat_high 중 하나를 지정하세요.")
+            sys.exit(1)
+
+        if args.keydate:
+            yyyymm     = args.keydate
+            budat_low  = month_start(yyyymm)
+            budat_high = month_end(yyyymm)
+        else:
+            budat_low  = _parse_date_arg(args.budat_low)
+            budat_high = _parse_date_arg(args.budat_high)
+            yyyymm = args.budat_high.strip()[:6]
+
+        accounts_input   = args.accounts
+        source_dir_input = args.source_dir
 
     config = get_config()
     logger = setup_logger("sapost.fbl5n", config)
 
-    # --source_dir 지정 시 config 메모리 내 덮어쓰기 (config.ini 파일 수정 없음)
-    if args.source_dir:
-        src = Path(args.source_dir)
+    # source_dir override (인터랙티브 or --source_dir 인수)
+    if source_dir_input:
+        src = Path(source_dir_input)
         config.set("PATHS", "source_dir", str(src))
         config.set("PATHS", "raw_dir",    str(src / "raw"))
         logger.info(f"source_dir override: {src}")
@@ -1113,8 +1267,8 @@ def main():
         logger.error(f"source_dir 를 찾을 수 없습니다: {source_dir}")
         sys.exit(1)
 
-    if args.accounts:
-        accounts = args.accounts
+    if accounts_input:
+        accounts = accounts_input
         logger.info(f"지정 계정 {len(accounts)}개: {accounts}")
     else:
         accounts = get_customer_accounts(source_dir, logger)
