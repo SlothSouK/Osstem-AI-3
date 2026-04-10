@@ -403,7 +403,7 @@ def append_to_source_file(df: pd.DataFrame, dest_file: Path, config, logger, yyy
                 ws.cell(row=r, column=col_idx["jijung"]).value = None if pd.isna(v) else v
 
             if col_idx["jeungbil"] and actual_budat_col:
-                ws.cell(row=r, column=col_idx["jeungbil"]).value = _parse_sap_date(row.get(actual_budat_col))
+                ws.cell(row=r, column=col_idx["jeungbil"]).value = _parse_sap_date(row.get(actual_budat_col))  # type: ignore[assignment]
 
             # elapsed는 append/offset 완료 후 apply_elapsed_formulas에서 일괄 처리
 
@@ -412,7 +412,7 @@ def append_to_source_file(df: pd.DataFrame, dest_file: Path, config, logger, yyy
                 ws.cell(row=r, column=col_idx["text"]).value = None if pd.isna(v) else v
 
             if col_idx["amount"] and actual_amount_col:
-                ws.cell(row=r, column=col_idx["amount"]).value = _parse_amount(row.get(actual_amount_col))
+                ws.cell(row=r, column=col_idx["amount"]).value = _parse_amount(row.get(actual_amount_col))  # type: ignore[assignment]
 
             if col_idx["currency"] and actual_currency_col:
                 v = row.get(actual_currency_col, "")
@@ -436,12 +436,12 @@ def append_to_source_file(df: pd.DataFrame, dest_file: Path, config, logger, yyy
             for foffset in formula_row_offsets:
                 frow = header_row + foffset
                 cell = ws.cell(row=frow, column=fcol_idx)
-                if isinstance(cell, openpyxl.cell.cell.MergedCell):
+                if isinstance(cell, openpyxl.cell.cell.MergedCell):  # type: ignore[attr-defined]
                     continue
                 if cell.value and isinstance(cell.value, str) and cell.value.startswith("="):
                     expanded = _expand_formula_range(cell.value, final_data_row)
                     if expanded != cell.value:
-                        cell.value = expanded
+                        cell.value = expanded  # type: ignore[assignment]
                         logger.debug(f"  [{sheet_name}] 수식 확장: {role} 행{frow} → {expanded}")
 
         logger.info(f"  [{sheet_name}] {added}행 추가 완료 (시작행: {next_row})")
@@ -746,6 +746,189 @@ def apply_elapsed_formulas(dest_file: Path, config, budat_high_date: date, logge
         wb.save(dest_file)
 
 
+def _extract_sap_currency_totals(
+    df: pd.DataFrame, amount_col: str, currency_col: str
+) -> dict[str, float]:
+    """
+    SAP FBL5N 결과에서 통화별 합계 추출.
+    SAP ALV는 소계 행을 자동 생성: 고객 컬럼에만 값이 있고
+    기호·지정·유형·D/C·G/L 계정이 모두 빈칸인 행이 통화별 합계 행.
+    해당 행이 있으면 그 값을 사용하고, 없으면 전체 행 합산으로 fallback.
+    """
+    # 빈칸 여부로 소계행 감지할 컬럼 키워드
+    empty_kws = ["기호", "지정", "유형", "D/C", "G/L"]
+    customer_kws = ["고객", "Customer", "Kund"]
+
+    customer_col = next(
+        (c for c in df.columns if any(k in str(c) for k in customer_kws)), None
+    )
+    empty_cols = [
+        c for c in df.columns if any(k in str(c) for k in empty_kws)
+    ]
+
+    if customer_col and empty_cols:
+        # 중복 컬럼명 대비: DataFrame 반환 시 첫 번째 컬럼(Series)만 사용
+        def _to_series(df: pd.DataFrame, col: str) -> "pd.Series":
+            s = df[col]
+            return s.iloc[:, 0] if isinstance(s, pd.DataFrame) else s  # type: ignore[return-value]
+
+        # 고객 컬럼에 값이 있고 감지 컬럼들이 모두 빈칸인 행 = SAP 소계 행
+        mask = _to_series(df, customer_col).astype(str).str.strip().ne("")
+        for col in empty_cols:
+            mask &= _to_series(df, col).astype(str).str.strip().eq("")
+        subtotal_df = df[mask]
+        if not subtotal_df.empty:
+            totals: dict[str, float] = {}
+            for _, row in subtotal_df.iterrows():
+                cur = str(row.get(currency_col, "") or "").strip() or "UNKNOWN"
+                raw = row.get(amount_col)
+                amt = _parse_amount(raw) if isinstance(raw, str) else (float(raw) if raw not in (None, "") else None)  # type: ignore[arg-type]
+                if amt is not None:
+                    totals[cur] = totals.get(cur, 0.0) + amt
+            return totals
+
+    # fallback: 전체 행 합산
+    totals = {}
+    for _, row in df.iterrows():
+        cur = str(row.get(currency_col, "") or "").strip() or "UNKNOWN"
+        amt = _parse_amount(row.get(amount_col))
+        if amt is not None:
+            totals[cur] = totals.get(cur, 0.0) + amt
+    return totals
+
+
+def _read_bal_sheet_header_totals(
+    dest_file: Path, config, sheet_candidates: list[str]
+) -> dict[str, float]:
+    """
+    채권명세서 잔액 시트의 헤더 영역(데이터 테이블 위)에서 통화별 합계 읽기.
+    헤더 영역에 통화코드(3자리 대문자)와 인접한 숫자 셀(수식 결과값)이 있는 구조 대응.
+    통화코드 셀 기준으로 같은 행의 인접 셀(+1, -1, +2, -2 열)에서 숫자를 탐색.
+    헤더 영역에서 못 찾으면 금액 컬럼 기준 데이터행 합산으로 fallback.
+    """
+    wb = openpyxl.load_workbook(dest_file, data_only=True, keep_links=False)
+    sheet_name = next((n for n in sheet_candidates if n in wb.sheetnames), None)
+    if sheet_name is None:
+        return {}
+
+    ws = wb[sheet_name]
+    hdr_ar_bal  = config.getint("APPEND", "header_row_ar_bal",  fallback=8)
+    hdr_default = config.getint("APPEND", "header_row_default", fallback=4)
+
+    is_ar_bal = any(k in sheet_name for k in ["외화", "AR", "ar"])
+    hdr = (_find_header_row(ws, COL_ALIASES["anchor"]) or hdr_ar_bal) if is_ar_bal else hdr_default
+
+    max_col = max(ws.max_column or 0, 30)
+    totals: dict[str, float] = {}
+
+    # ── 우선: 금액 컬럼 인덱스 기준 헤더 영역 탐색 ──────────────────
+    # 금액 헤더 열에 있는 수식 결과값(숫자)을 통화별 합계로 사용.
+    # 같은 행에서 3자리 통화코드를 찾아 매핑.
+    amount_col_idx = _find_col_idx(ws, hdr, COL_ALIASES["amount"])
+    if amount_col_idx:
+        for r in range(1, hdr):
+            cell_val = ws.cell(row=r, column=amount_col_idx).value
+            if cell_val is None:
+                continue
+            try:
+                amt = float(cell_val)  # type: ignore[arg-type]
+            except (ValueError, TypeError):
+                continue
+            # 같은 행에서 통화코드 탐색
+            for c in range(1, max_col + 1):
+                if c == amount_col_idx:
+                    continue
+                v = ws.cell(row=r, column=c).value
+                if isinstance(v, str) and re.match(r'^[A-Z]{3}$', v.strip()):
+                    cur = v.strip()
+                    totals[cur] = totals.get(cur, 0.0) + amt
+                    break
+
+    if totals:
+        return totals
+
+    # ── fallback: 헤더 영역 전체 스캔 (통화코드 셀 + 인접 숫자) ──────
+    for r in range(1, hdr):
+        for c in range(1, max_col + 1):
+            val = ws.cell(row=r, column=c).value
+            if not isinstance(val, str):
+                continue
+            val = val.strip()
+            if not re.match(r'^[A-Z]{3}$', val):
+                continue
+            for dc in (1, -1, 2, -2):
+                nc = c + dc
+                if not (1 <= nc <= max_col):
+                    continue
+                neighbor = ws.cell(row=r, column=nc).value
+                if neighbor is None:
+                    continue
+                try:
+                    amt = float(neighbor)  # type: ignore[arg-type]
+                    totals[val] = totals.get(val, 0.0) + amt
+                    break
+                except (ValueError, TypeError):
+                    pass
+
+    if totals:
+        return totals
+
+    # ── fallback2: 금액 컬럼 데이터행 합산 ───────────────────────────
+    amount_idx   = _find_col_idx(ws, hdr, COL_ALIASES["amount"])
+    currency_idx = _find_col_idx(ws, hdr, COL_ALIASES["currency"])
+    anchor_idx   = _find_col_idx(ws, hdr, COL_ALIASES["jijung"]) or \
+                   _find_col_idx(ws, hdr, COL_ALIASES["jeungbil"])
+
+    if not (amount_idx and currency_idx and anchor_idx):
+        return {}
+
+    last_row = _find_last_data_row(ws, hdr, anchor_idx)
+    for r in range(hdr + 1, last_row + 1):
+        if ws.cell(row=r, column=anchor_idx).value is None:
+            continue
+        cur = str(ws.cell(row=r, column=currency_idx).value or "").strip() or "UNKNOWN"
+        raw = ws.cell(row=r, column=amount_idx).value
+        try:
+            amt = float(raw) if raw not in (None, "") else 0.0  # type: ignore[arg-type]
+        except (ValueError, TypeError):
+            amt = _parse_amount(str(raw)) or 0.0
+        totals[cur] = totals.get(cur, 0.0) + amt
+    return totals
+
+
+def _format_verify_result(
+    label: str,
+    account: str,
+    query_date: str,
+    sheet_name: str,
+    sap_totals: dict[str, float],
+    excel_totals: dict[str, float],
+) -> str:
+    """검증 결과 문자열 생성."""
+    all_cur = sorted(set(list(sap_totals.keys()) + list(excel_totals.keys())))
+    lines = [
+        f"{'=' * 60}",
+        f"[{label}] 계정: {account}  조회일: {query_date}  대상시트: {sheet_name}",
+        f"{'─' * 60}",
+        f"{'통화':<8} {'SAP 합계':>18} {'엑셀 합계':>18} {'차이':>18} {'결과':>6}",
+        f"{'─' * 60}",
+    ]
+    all_match = True
+    for cur in all_cur:
+        sap_v   = sap_totals.get(cur, 0.0)
+        excel_v = excel_totals.get(cur, 0.0)
+        diff    = sap_v - excel_v
+        ok      = abs(diff) < 0.01
+        if not ok:
+            all_match = False
+        mark = "✓" if ok else "✗"
+        lines.append(f"{cur:<8} {sap_v:>18,.2f} {excel_v:>18,.2f} {diff:>18,.2f} {mark:>6}")
+    lines.append(f"{'─' * 60}")
+    lines.append(f"최종: {'일치 ✓' if all_match else '불일치 ✗'}")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def get_customer_accounts(source_dir: Path, logger) -> list[str]:
     """source_dir 의 파일명이 7자리 숫자로 시작하는 파일에서 고객계정 수집"""
     import re
@@ -797,7 +980,9 @@ class FBL5NDownloader:
 
         self.augdt_low_field      = config.get("SAP", "augdt_low_field",      fallback="wnd[0]/usr/ctxtSO_AUGDT-LOW")
         self.augdt_high_field     = config.get("SAP", "augdt_high_field",     fallback="wnd[0]/usr/ctxtSO_AUGDT-HIGH")
-        self.cleared_items_radio  = config.get("SAP", "cleared_items_radio",  fallback="wnd[0]/usr/radX_CLSEL")
+        self.cleared_items_radio       = config.get("SAP", "cleared_items_radio",       fallback="wnd[0]/usr/radX_CLSEL")
+        self.open_items_radio          = config.get("SAP", "open_items_radio",          fallback="wnd[0]/usr/radX_OPSEL")
+        self.open_items_keydate_field  = config.get("SAP", "open_items_keydate_field",  fallback="wnd[0]/usr/ctxtSD_OPKEY")
 
         self.raw_dir    = Path(config.get("PATHS", "raw_dir"))
         self.source_dir = Path(config.get("PATHS", "source_dir"))
@@ -815,6 +1000,14 @@ class FBL5NDownloader:
         """모든 고객계정에 대해 FBL5N 실행 → 미결항목 다운로드 → 반제항목 다운로드"""
         success, failed = [], []
 
+        # 사전 검증 기준일: budat_low 하루 전날
+        from datetime import timedelta
+        budat_low_date = _parse_sap_date(budat_low)
+        pre_keydate  = (budat_low_date - timedelta(days=1)).strftime("%Y.%m.%d") if budat_low_date else budat_low
+        post_keydate = budat_high
+
+        verify_log: list[str] = []
+
         for i, account in enumerate(accounts, 1):
             self.logger.info(f"[{i}/{len(accounts)}] 계정: {account}  전기일: {budat_low} ~ {budat_high}")
 
@@ -826,6 +1019,12 @@ class FBL5NDownloader:
             else:
                 working_copy = None
                 self.logger.warning(f"  원본 파일 없음 — append 건너뜀 (계정: {account})")
+
+            # ── 사전 검증 (기간 시작일 하루 전, 원본 파일 기준) ──
+            pre_target = find_source_file(self.source_dir, account)  # 원본(수정 전) 파일
+            if pre_target:
+                self.logger.info(f"  [검증-사전] 기준일: {pre_keydate}")
+                self.run_verify(account, pre_keydate, pre_target, "사전검증", verify_log)
 
             # 1. 미결항목 (전기일 기간)
             try:
@@ -844,12 +1043,24 @@ class FBL5NDownloader:
                 self.logger.warning(f"  [offset] 건너뜀 ({account}): {e}")
                 self._go_back_to_start()
 
+            # ── 사후 검증 (조회 종료일, 작업 완료된 복사본 기준, 임시항목 포함) ──
+            if working_copy:
+                self.logger.info(f"  [검증-사후] 기준일: {post_keydate}")
+                self.run_verify(account, post_keydate, working_copy, "사후검증", verify_log, noted_items=True)
+
             success.append(account)
 
         self.logger.info("=" * 50)
         self.logger.info(f"완료: 성공 {len(success)}건 / 실패 {len(failed)}건")
         if failed:
             self.logger.warning(f"실패 계정: {failed}")
+
+        # ── 검증 결과 txt 저장 ──
+        if verify_log:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            verify_path = self.raw_dir / f"verify_{yyyymm}_{ts}.txt"
+            verify_path.write_text("\n".join(verify_log), encoding="utf-8")
+            self.logger.info(f"검증 결과 저장: {verify_path}")
 
     def _run_single(self, account: str, budat_low: str, budat_high: str, yyyymm: str,
                     working_copy: "Path | None") -> Path:
@@ -999,9 +1210,16 @@ class FBL5NDownloader:
             except Exception:
                 headers[col] = col
 
-        # 전체 데이터 읽기
+        # 전체 데이터 읽기 (스크롤 동기화: 화면 밖 행도 누락 없이 읽기)
+        visible_rows = max(grid.VisibleRowCount, 1) if hasattr(grid, "VisibleRowCount") else 20
         records = []
         for row in range(row_count):
+            # 현재 행이 화면 밖이면 그리드 스크롤 이동
+            if row % visible_rows == 0:
+                try:
+                    grid.FirstVisibleRow = row
+                except Exception:
+                    pass
             record = {}
             for col in columns:
                 try:
@@ -1029,6 +1247,151 @@ class FBL5NDownloader:
         self.logger.info(f"  엑셀 저장 완료: {dest}  ({len(df)}행)")
 
         return df
+
+    def _read_grid_to_df(self) -> pd.DataFrame:
+        """ALV 그리드를 DataFrame으로만 읽기 (Excel 저장 없음, 검증용)."""
+        grid_id = self.config.get("SAP", "grid_id")
+        grid = self.session.findById(grid_id)
+
+        row_count = grid.RowCount
+        if row_count == 0:
+            self.logger.info("  [검증] 조회 결과 없음 → 0으로 간주")
+            return pd.DataFrame()
+
+        columns = list(grid.ColumnOrder)
+        headers: dict[str, str] = {}
+        for col in columns:
+            try:
+                headers[col] = grid.GetDisplayedColumnTitle(col)
+            except Exception:
+                headers[col] = col
+
+        visible_rows = max(grid.VisibleRowCount, 1) if hasattr(grid, "VisibleRowCount") else 20
+        records = []
+        for row in range(row_count):
+            if row % visible_rows == 0:
+                try:
+                    grid.FirstVisibleRow = row
+                except Exception:
+                    pass
+            record: dict[str, Any] = {}
+            for col in columns:
+                try:
+                    record[col] = grid.GetCellValue(row, col)
+                except Exception:
+                    record[col] = ""
+            records.append(record)
+
+        df = pd.DataFrame(records, columns=columns)
+        df = df.rename(columns=headers)
+        self.logger.info(f"  [검증] 그리드 읽기 완료: {len(df)}행")
+        return df
+
+    def _query_for_verify(
+        self, account: str, keydate: str, normal_only: bool, noted_items: bool = False
+    ) -> pd.DataFrame:
+        """
+        검증용 FBL5N 미결항목 조회 — 메모리(DataFrame)에만 보관, Excel 저장 없음.
+        normal_only=True  → 일반항목만 체크 (외화외상매출금 검증)
+        normal_only=False → 특별G/L거래만 체크 (미수금 검증)
+        noted_items       → 임시항목 체크 여부 (사후 검증 시 True)
+        keydate: 'YYYY.MM.DD' 형식 기준일 — 미결항목 모드로 해당 일자 기준 조회
+        """
+        self._navigate_to_fbl5n()
+        time.sleep(1)   # 화면 전환 안정화
+        s = self.session
+
+        s.findById(self.customer_field).text = account
+        try:
+            s.findById(self.company_code_field).text = self.company_code
+        except Exception:
+            pass
+        # 미결항목 모드 선택
+        try:
+            s.findById(self.open_items_radio).select()
+        except Exception:
+            self.logger.warning("  [검증] 미결항목 라디오 선택 실패 — all_items_radio 사용")
+            try:
+                s.findById(self.all_items_radio).select()
+            except Exception:
+                pass
+        # 미결항목 모드: 주요일자의 미결항목 필드에 keydate 입력
+        try:
+            s.findById(self.open_items_keydate_field).text = keydate
+        except Exception as e:
+            self.logger.warning(f"  [검증] 주요일자 필드 입력 실패: {e}")
+        # 체크박스 — 각각 분리하여 하나 실패해도 나머지 실행
+        try:
+            s.findById(self.normal_items_chk).selected = normal_only
+        except Exception as e:
+            self.logger.warning(f"  [검증] 일반항목 체크 실패: {e}")
+        try:
+            s.findById(self.special_gl_chk).selected = not normal_only
+        except Exception as e:
+            self.logger.warning(f"  [검증] 특별G/L 체크 실패: {e}")
+        try:
+            s.findById(self.noted_items_chk).selected = noted_items
+        except Exception as e:
+            self.logger.warning(f"  [검증] 임시항목 체크 실패: {e}")
+
+        s.findById("wnd[0]").sendVKey(self.execute_vkey)
+        time.sleep(3)
+
+        # Excel 저장 없이 그리드 → DataFrame만 반환
+        return self._read_grid_to_df()
+
+    def run_verify(
+        self,
+        account: str,
+        keydate: str,
+        working_copy: "Path | None",
+        label: str,
+        verify_log: list[str],
+        noted_items: bool = False,
+    ) -> None:
+        """
+        단일 계정 검증 실행.
+        일반항목(외화외상매출금(잔액)) + 특별G/L(미수금(잔액)) 각각 조회 후
+        채권명세서 잔액 시트 합계와 비교. 결과를 verify_log에 추가.
+        noted_items=True 시 두 조회 모두 임시항목 체크 (사후 검증용).
+        """
+        sap_amount   = self.config.get("APPEND", "col_gl_amount", fallback="총계정원장금액")
+        sap_currency = self.config.get("APPEND", "col_currency",  fallback="통화")
+
+        sh_ar_bal  = [s.strip() for s in self.config.get("APPEND", "sheet_ar_bal",       fallback="외화외상매출금(잔액)").split("|")]
+        sh_mis_bal = [s.strip() for s in self.config.get("APPEND", "sheet_misugeun_bal", fallback="미수금(잔액)").split("|")]
+
+        for normal_only, sheet_candidates, sheet_label in [
+            (True,  sh_ar_bal,  "외화외상매출금(잔액)"),
+            (False, sh_mis_bal, "미수금(잔액)"),
+        ]:
+            try:
+                df = self._query_for_verify(account, keydate, normal_only, noted_items=noted_items)
+            except Exception as e:
+                msg = f"[{label}] {account} 검증 조회 실패 ({sheet_label}): {e}"
+                self.logger.warning(msg)
+                verify_log.append(msg)
+                self._go_back_to_start()
+                continue
+
+            actual_amount   = _find_df_col(df, sap_amount)
+            actual_currency = _find_df_col(df, sap_currency)
+
+            if not actual_amount or not actual_currency:
+                msg = f"[{label}] {account} 금액/통화 컬럼 없음 — 검증 건너뜀 ({sheet_label})"
+                self.logger.warning(msg)
+                verify_log.append(msg)
+                continue
+
+            sap_totals   = _extract_sap_currency_totals(df, actual_amount, actual_currency)
+            excel_totals = _read_bal_sheet_header_totals(working_copy, self.config, sheet_candidates) \
+                           if working_copy else {}
+
+            result_str = _format_verify_result(
+                label, account, keydate, sheet_label, sap_totals, excel_totals
+            )
+            self.logger.info(f"\n{result_str}")
+            verify_log.append(result_str)
 
     def _go_back_to_start(self):
         """오류 발생 시 초기 화면으로 복귀"""
