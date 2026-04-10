@@ -76,6 +76,14 @@ def _reset_state():
 # 사이드바 — 메뉴 (추후 모듈 추가 시 options 목록에 항목 추가)
 # ─────────────────────────────────────────────────────────────
 with st.sidebar:
+    _assets = Path(__file__).parent / "assets"
+    _imgs = sorted(_assets.glob("*.png")) if _assets.exists() else []
+    if len(_imgs) >= 2:
+        _c1, _c2 = st.columns(2)
+        _c1.image(str(_imgs[0]), width=110)
+        _c2.image(str(_imgs[1]), width=110)
+    elif len(_imgs) == 1:
+        st.image(str(_imgs[0]), width=120)
     st.markdown("## 해외관리실의 공간")
     st.divider()
     menu = st.radio(
