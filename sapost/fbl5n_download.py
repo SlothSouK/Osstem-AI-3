@@ -59,9 +59,10 @@ from sapost.src.utils import get_config, setup_logger
 
 try:
     import win32com.client
+    _WIN32_AVAILABLE = True
 except ImportError:
-    print("ERROR: pywin32가 설치되어 있지 않습니다. pip install pywin32 를 실행하세요.")
-    sys.exit(1)
+    win32com = None  # type: ignore[assignment]
+    _WIN32_AVAILABLE = False
 
 from dotenv import load_dotenv
 import os
@@ -990,7 +991,9 @@ class FBL5NDownloader:
 
     def connect(self):
         """실행 중인 SAP GUI 세션에 연결"""
-        sap_gui_auto = win32com.client.GetObject("SAPGUI")
+        if not _WIN32_AVAILABLE:
+            raise RuntimeError("pywin32가 설치되어 있지 않습니다. Windows 환경에서 실행하세요.")
+        sap_gui_auto = win32com.client.GetObject("SAPGUI")  # type: ignore[union-attr]
         application  = sap_gui_auto.GetScriptingEngine
         connection   = application.Children(0)
         self.session = connection.Children(0)
